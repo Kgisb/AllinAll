@@ -167,7 +167,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio(
         "Go to",
-        ["Cash-in", "Dashboard", "MIS", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker"],  # ← add this
+        ["Cash-in", "Dashboard", "MIS", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker", "Marketing Lead Performance & Requirement"],  # ← add this
         index=0
     )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
@@ -7159,5 +7159,299 @@ elif view == "HubSpot Deal Score tracker":
         "Notes: Normalization multiplies young-deal scores by min(ref_age / age, 1). "
         "Calibration uses historical lookback (excluding current month) with Laplace smoothing."
     )
+# ============================================================
+# Marketing Lead Performance & Requirement (updated with Traction)
+# ============================================================
+elif view == "Marketing Lead Performance & Requirement":
+    import pandas as pd, numpy as np
+    import altair as alt
+    from datetime import date
+    from calendar import monthrange
+
+    st.subheader("Marketing Lead Performance & Requirement")
+
+    # --------- small helpers ----------
+    def _pick(df, preferred, cands):
+        if preferred and preferred in df.columns: return preferred
+        for c in cands:
+            if c in df.columns: return c
+        return None
+
+    def _month_bounds(d: date):
+        return date(d.year, d.month, 1), date(d.year, d.month, monthrange(d.year, d.month)[1])
+
+    # --------- resolve columns ----------
+    _create = _pick(df_f, globals().get("create_col"),
+                    ["Create Date","Created Date","Deal Create Date","CreateDate","Created On"])
+    _pay    = _pick(df_f, globals().get("pay_col"),
+                    ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
+    _src    = _pick(df_f, globals().get("source_col"),
+                    ["JetLearn Deal Source","Deal Source","Source","Lead Source","_src_raw"])
+    _cty    = _pick(df_f, globals().get("country_col"),
+                    ["Country","Student Country","Deal Country"])
+
+    if not _create or not _pay or not _src:
+        st.warning("Please map Create Date, Payment Received Date and JetLearn Deal Source to use this tab.", icon="⚠️")
+        st.stop()
+
+    d = df_f.copy()
+    d["__C"] = pd.to_datetime(d[_create], errors="coerce", dayfirst=True)
+    d["__P"] = pd.to_datetime(d[_pay],    errors="coerce", dayfirst=True)
+    d["__SRC"] = d[_src].fillna("Unknown").astype(str).str.strip()
+    d["__CTY"] = d[_cty].fillna("Unknown").astype(str).str.strip() if _cty else "All"
+
+    d["__Cper"] = d["__C"].dt.to_period("M")
+    d["__Pper"] = d["__P"].dt.to_period("M")
+
+    # --------- controls ----------
+    c1, c2, c3 = st.columns([1.0, 1.2, 1.0])
+    with c1:
+        lookback = st.selectbox("Lookback months (exclude current)", [3, 6, 9, 12], index=1,
+                                help="Used to learn average M0 rate and average M–N carry-in per month.")
+    with c2:
+        # Source filter (multi, include "All")
+        all_sources = sorted(d["__SRC"].dropna().unique().tolist())
+        src_opts = ["All"] + all_sources
+        src_sel = st.multiselect("JetLearn Deal Source", options=src_opts, default=["All"], help="Pick one or more sources; 'All' means no source filter.")
+    with c3:
+        cty_scope = st.selectbox("Country scope", ["All countries","Top 10 countries","Top 20 countries"], index=0)
+
+    # Country ranking for selected sources (based on enrolments in lookback)
+    today_d = date.today()
+    cur_per = pd.Period(today_d, freq="M")
+    mstart, mend = _month_bounds(today_d)
+    mlen = monthrange(today_d.year, today_d.month)[1]
+    days_elapsed = (today_d - mstart).days + 1
+    days_left = max(0, mlen - days_elapsed)
+    elapsed_frac = min(1.0, days_elapsed / mlen)
+
+    hist_months = [cur_per - i for i in range(1, lookback+1)]
+
+    # Apply source filter (if "All" present -> no restriction)
+    if "All" in src_sel or not src_sel:
+        d_use = d.copy()
+        sel_sources = all_sources
+    else:
+        d_use = d[d["__SRC"].isin(src_sel)].copy()
+        sel_sources = src_sel
+
+    # Build masks for lookback window by month
+    d_use["__in_hist"] = d_use["__Cper"].isin(hist_months)
+
+    # Country top-N (by enrolments in lookback for selected sources)
+    if _cty:
+        enrol_hist_mask = d_use["__Pper"].isin(hist_months) & d_use["__in_hist"]  # payment & created in lookback months (keep same cohort universe)
+        cty_counts = (d_use.loc[enrol_hist_mask]
+                         .groupby("__CTY").size().sort_values(ascending=False))
+        if cty_scope == "Top 10 countries":
+            top_countries = cty_counts.head(10).index.tolist()
+        elif cty_scope == "Top 20 countries":
+            top_countries = cty_counts.head(20).index.tolist()
+        else:
+            top_countries = None
+        if top_countries is not None and len(top_countries) > 0:
+            d_use = d_use[d_use["__CTY"].isin(top_countries)].copy()
+    # else: no country column -> do nothing
+
+    # --------- learn M0 rate and M–N carry-in (per month) ----------
+    rows = []
+    for m in hist_months:
+        dc = int((d_use["__Cper"] == m).sum())
+        m0 = int(((d_use["__Cper"] == m) & (d_use["__Pper"] == m)).sum())
+        mn = int(((d_use["__Pper"] == m) & (d_use["__Cper"] < m)).sum())
+        rows.append({"Month": str(m), "DealsCreated": dc, "M0_Enrol": m0, "MN_Enrol": mn})
+    hist_tbl = pd.DataFrame(rows)
+
+    if hist_tbl["DealsCreated"].sum() > 0:
+        avg_m0_rate = hist_tbl["M0_Enrol"].sum() / hist_tbl["DealsCreated"].sum()
+    else:
+        avg_m0_rate = 0.0
+    avg_mn_cnt = hist_tbl["MN_Enrol"].mean() if not hist_tbl.empty else 0.0
+
+    # --------- planner (interactive) ----------
+    st.markdown("### Planner")
+    p1, p2, p3 = st.columns([1.0, 1.0, 1.2])
+    with p1:
+        planned_deals = st.number_input("Planned deals to create (this month)", min_value=0, value=100, step=10)
+    with p2:
+        target_enrol = st.number_input("Target enrolments (optional)", min_value=0, value=0, step=10,
+                                       help="If > 0, we’ll compute required deals to reach the target.")
+    with p3:
+        st.caption(
+            f"Lookback: **{lookback} mo** • Avg M0 rate: **{avg_m0_rate:.2%}** • Avg M–N carry-in: **{avg_mn_cnt:.1f}** / month"
+        )
+
+    expected_enrol = planned_deals * avg_m0_rate + avg_mn_cnt
+    if avg_m0_rate > 0:
+        req_deals_for_target = max(0.0, (target_enrol - avg_mn_cnt)) / avg_m0_rate if target_enrol > 0 else np.nan
+    else:
+        req_deals_for_target = np.nan
+
+    # KPI cards
+    st.markdown(
+        """
+        <style>
+          .kpi-card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 12px 14px; background: #fff; }
+          .kpi-title { font-size: 0.85rem; color: #6b7280; margin-bottom: 6px; }
+          .kpi-value { font-size: 1.6rem; font-weight: 700; }
+          .kpi-sub { font-size: 0.8rem; color: #6b7280; margin-top: 4px; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    k1,k2,k3 = st.columns(3)
+    with k1:
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Expected Enrolments</div>"
+            f"<div class='kpi-value'>{expected_enrol:.1f}</div>"
+            f"<div class='kpi-sub'>= {planned_deals} × {avg_m0_rate:.2%} + {avg_mn_cnt:.1f}</div></div>",
+            unsafe_allow_html=True
+        )
+    with k2:
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Avg M0 Conversion Rate</div>"
+            f"<div class='kpi-value'>{avg_m0_rate:.1%}</div>"
+            f"<div class='kpi-sub'>Lookback weighted</div></div>",
+            unsafe_allow_html=True
+        )
+    with k3:
+        req_txt = "–" if np.isnan(req_deals_for_target) or target_enrol <= 0 else f"{req_deals_for_target:.1f}"
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Required Deals (to hit Target)</div>"
+            f"<div class='kpi-value'>{req_txt}</div>"
+            f"<div class='kpi-sub'>Assumes carry-in ≈ {avg_mn_cnt:.1f} / mo</div></div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # --------- NEW: This Month So Far — Traction ----------
+    st.markdown("### This Month So Far — Traction")
+    # Created so far (1..today)
+    created_so_far = int((d_use["__C"].dt.date.between(mstart, today_d)).sum())
+    # Payments so far (1..today) split into same-month vs carry-in
+    same_to_date = int(((d_use["__P"].dt.date.between(mstart, today_d)) & (d_use["__Cper"] == cur_per)).sum())
+    prev_to_date = int(((d_use["__P"].dt.date.between(mstart, today_d)) & (d_use["__Cper"] <  cur_per)).sum())
+    total_to_date = same_to_date + prev_to_date
+
+    # Pace-adjusted expectations for same & carry-in up to today
+    exp_same_to_date = created_so_far * avg_m0_rate * elapsed_frac
+    exp_prev_to_date = avg_mn_cnt * elapsed_frac
+    exp_total_to_date = exp_same_to_date + exp_prev_to_date
+
+    tka, tkb, tkc, tkd = st.columns(4)
+    with tka:
+        st.metric("Deals Created (so far)", f"{created_so_far:,}",
+                  help=f"{mstart.isoformat()} → {today_d.isoformat()}")
+    with tkb:
+        st.metric("Enrolments — Same-month (so far)", f"{same_to_date:,}",
+                  delta=f"exp {exp_same_to_date:.1f}", help="Payments from deals created this month")
+    with tkc:
+        st.metric("Enrolments — Carry-in (so far)", f"{prev_to_date:,}",
+                  delta=f"exp {exp_prev_to_date:.1f}", help="Payments from deals created before this month")
+    with tkd:
+        st.metric("Total Enrolments (so far)", f"{total_to_date:,}",
+                  delta=f"exp {exp_total_to_date:.1f}")
+
+    # Quick diagnostic text
+    msgs = []
+    # Quality: compare same-to-date rate vs avg
+    same_rate_so_far = (same_to_date / created_so_far) if created_so_far > 0 else 0.0
+    if created_so_far > 0:
+        if same_rate_so_far + 1e-9 < 0.9 * avg_m0_rate:
+            msgs.append("**Quality lag:** Same-month conversion rate is trailing lookback average. Consider improving lead quality/nurture.")
+        elif same_rate_so_far > 1.1 * avg_m0_rate:
+            msgs.append("**Quality strong:** Same-month conversion rate is exceeding the lookback average.")
+    # Quantity: if target exists, check pace
+    if target_enrol > 0 and avg_m0_rate > 0:
+        on_pace_deals_by_today = (max(0.0, target_enrol - avg_mn_cnt) / avg_m0_rate) * elapsed_frac
+        if created_so_far + 1e-9 < 0.9 * on_pace_deals_by_today:
+            msgs.append("**Quantity lag:** Deals created are behind pace vs target; consider adding volume.")
+        elif created_so_far > 1.1 * on_pace_deals_by_today:
+            msgs.append("**Quantity strong:** Deals created are ahead of pace vs target.")
+    if not msgs:
+        msgs.append("Trajectory looks **on-pace** versus learned averages for this month-to-date.")
+
+    st.info(" • ".join(msgs))
+
+    # Small comparison chart (actual vs expected to date)
+    comp_df = pd.DataFrame({
+        "Component": ["Same-month", "Carry-in", "Total"],
+        "Actual": [same_to_date, prev_to_date, total_to_date],
+        "Expected": [exp_same_to_date, exp_prev_to_date, exp_total_to_date],
+    })
+    comp_melt = comp_df.melt(id_vars=["Component"], value_vars=["Actual","Expected"], var_name="Type", value_name="Count")
+    st.altair_chart(
+        alt.Chart(comp_melt)
+           .mark_bar(opacity=0.9)
+           .encode(
+               x=alt.X("Component:N"),
+               y=alt.Y("Count:Q"),
+               color=alt.Color("Type:N"),
+               tooltip=["Component","Type","Count"]
+           ).properties(height=280, title="Month-to-date: Actual vs Expected (pace-adjusted)"),
+        use_container_width=True
+    )
+
+    st.markdown("---")
+
+    # --------- Visual: historical composition (M0 vs M–N) ----------
+    st.markdown("### Historical Composition (lookback)")
+    if not hist_tbl.empty:
+        hist_plot = hist_tbl.melt(id_vars=["Month"], value_vars=["M0_Enrol","MN_Enrol"],
+                                  var_name="Component", value_name="Count")
+        comp_chart = (
+            alt.Chart(hist_plot)
+            .mark_bar(opacity=0.9)
+            .encode(
+                x=alt.X("Month:N", sort=hist_tbl["Month"].tolist()),
+                y=alt.Y("Count:Q"),
+                color=alt.Color("Component:N", title="", scale=alt.Scale(scheme="set2")),
+                tooltip=["Month:N","Component:N","Count:Q"]
+            )
+            .properties(height=320, title="Enrolments per month — M0 vs M–N (carry-in)")
+        )
+        st.altair_chart(comp_chart, use_container_width=True)
+
+        with st.expander("Table — Lookback by month"):
+            st.dataframe(hist_tbl, use_container_width=True)
+            st.download_button("Download CSV", hist_tbl.to_csv(index=False).encode("utf-8"),
+                               "marketing_lead_perf_lookback_by_month.csv","text/csv")
+    else:
+        st.info("No data in the chosen lookback for selected filters.")
+
+    # --------- Per-source details (same filters & country scope) ----------
+    st.markdown("### Per-Source Details (for the selected filters)")
+    per_rows = []
+    for s in sel_sources:
+        ds = d_use if s in ("All",) else d_use[d_use["__SRC"] == s]
+        rows = []
+        for m in hist_months:
+            dc = int((ds["__Cper"] == m).sum())
+            m0 = int(((ds["__Cper"] == m) & (ds["__Pper"] == m)).sum())
+            mn = int(((ds["__Pper"] == m) & (ds["__Cper"] < m)).sum())
+            rows.append((dc, m0, mn))
+        if not rows:
+            continue
+        tmp = pd.DataFrame(rows, columns=["DealsCreated","M0_Enrol","MN_Enrol"])
+        dc_sum = tmp["DealsCreated"].sum()
+        m0_sum = tmp["M0_Enrol"].sum()
+        mn_avg = tmp["MN_Enrol"].mean()
+        m0_rate = (m0_sum / dc_sum) if dc_sum > 0 else 0.0
+        per_rows.append({"Source": s, "M0_Rate": m0_rate, "MN_CarryIn_Avg": mn_avg})
+
+    per_tbl = pd.DataFrame(per_rows)
+    if not per_tbl.empty:
+        if target_enrol > 0:
+            per_tbl["Req_Deals_for_Target"] = np.where(
+                per_tbl["M0_Rate"] > 0,
+                np.maximum(0.0, (target_enrol - per_tbl["MN_CarryIn_Avg"])) / per_tbl["M0_Rate"],
+                np.nan
+            )
+        st.dataframe(per_tbl.sort_values("M0_Rate", ascending=False), use_container_width=True)
+        st.download_button("Download CSV — Per-Source", per_tbl.to_csv(index=False).encode("utf-8"),
+                           "marketing_lead_perf_per_source.csv","text/csv")
+    else:
+        st.info("No per-source details to show with current filters.")
 
 
