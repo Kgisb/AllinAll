@@ -7162,138 +7162,355 @@ elif view == "HubSpot Deal Score tracker":
 # ============================================================
 # Marketing Lead Performance & Requirement (updated with Traction)
 # ============================================================
-# ============================================================
-    # -----------------------------------------------------------
-    # NEW: Mix Effect — deviation due to lead-mix change
-    #      (Plan vs Baseline = current MTD create mix)
-    # -----------------------------------------------------------
-    if line_rows:
-        st.markdown("---")
-        st.markdown("### Mix Effect — Impact of Lead Mix on Expected Enrolments")
+# =========================
+# Marketing Lead Performance & Requirement (FULL with Mix Effect)
+# =========================
+elif view == "Marketing Lead Performance & Requirement":
+    def _mlpr_tab():
+        st.subheader("Marketing Lead Performance & Requirement")
 
-        # Total planned deals across line items (already allocated above)
-        total_planned_deals = float(lines["PlannedDeals_Line"].sum())
+        # ---------- Resolve columns ----------
+        def _pick(df, preferred, cands):
+            if preferred and preferred in df.columns: return preferred
+            for c in cands:
+                if c in df.columns: return c
+            return None
 
-        # Build MTD create mix at Source × Country granularity
-        mtd_create_mask = d_use["__C"].dt.date.between(mstart, today_d)
-        if _cty:
-            grp_cols = ["__SRC", "__CTY"]
+        _create = _pick(df_f, globals().get("create_col"),
+                        ["Create Date","Created Date","Deal Create Date","CreateDate","Created On"])
+        _pay    = _pick(df_f, globals().get("pay_col"),
+                        ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
+        _src    = _pick(df_f, globals().get("source_col"),
+                        ["JetLearn Deal Source","Deal Source","Source","_src_raw","Lead Source"])
+        _cty    = _pick(df_f, globals().get("country_col"),
+                        ["Country","Student Country","Deal Country","Lead Country"])
+
+        if not _create or not _pay or not _src:
+            st.warning("Please map Create Date, Payment Received Date and JetLearn Deal Source in the sidebar.", icon="⚠️")
+            return
+
+        # ---------- Controls ----------
+        c1, c2, c3, c4 = st.columns([1,1,1,1.2])
+        with c1:
+            scope = st.selectbox("Date scope", ["This month","Last month","Custom"], index=0)
+        with c2:
+            lookback = st.selectbox("Lookback (full months, excl. current)", [3, 6, 12], index=1)
+        with c3:
+            mode = st.radio("Mode", ["Cohort","MTD"], index=0, horizontal=True,
+                            help="Affects 'Actual so far' comparison only (Cohort=payments in window; MTD=created & paid in window).")
+        with c4:
+            top_countries = st.selectbox("Country scope", ["Top 10","Top 20","All"], index=0,
+                                         help="Determines which countries are used for auto-allocation & rates.")
+
+        today_d = date.today()
+        if scope == "This month":
+            mstart, mend = month_bounds(today_d)
+        elif scope == "Last month":
+            mstart, mend = last_month_bounds(today_d)
         else:
-            grp_cols = ["__SRC"]
+            d1, d2 = st.columns(2)
+            with d1: mstart = st.date_input("Start", value=today_d.replace(day=1), key="mlpr_start")
+            with d2: mend   = st.date_input("End", value=month_bounds(today_d)[1], key="mlpr_end")
+            if mend < mstart:
+                st.error("End date cannot be before start date.")
+                return
 
-        mtd_mix = (
-            d_use.loc[mtd_create_mask, grp_cols]
+        st.caption(f"Scope: **{mstart} → {mend}** • Lookback: **{lookback}m** • Mode for actual: **{mode}**")
+
+        # ---------- Prep dataframe ----------
+        d = df_f.copy()
+        d["__C"] = coerce_datetime(d[_create])
+        d["__P"] = coerce_datetime(d[_pay])
+        d["__SRC"] = d[_src].fillna("Unknown").astype(str).str.strip()
+        if _cty:
+            d["__CTY"] = d[_cty].fillna("Unknown").astype(str).str.strip()
+        else:
+            d["__CTY"] = "All"
+
+        # ---------- Build lookback months ----------
+        cur_per = pd.Period(mstart, freq="M")
+        lb_months = [cur_per - i for i in range(1, lookback+1)]  # exclude current
+        if not lb_months:
+            st.info("No lookback months selected.")
+            return
+
+        # ---------- Historical M0 and carry-in (M−N) by Source × Country ----------
+        C_per = d["__C"].dt.to_period("M")
+        P_per = d["__P"].dt.to_period("M")
+
+        # Determine top countries set (by lookback enrolments) per source
+        if _cty:
+            enrol_lb_mask = d["__P"].dt.to_period("M").isin(lb_months)
+            rank_cty = (
+                d.loc[enrol_lb_mask]
+                 .groupby(["__SRC","__CTY"]).size()
+                 .rename("cnt").reset_index()
+            )
+            def _keep_list(g, k):
+                g = g.sort_values("cnt", ascending=False)
+                if top_countries == "All": return g["__CTY"].tolist()
+                n = 10 if top_countries == "Top 10" else 20
+                return g["__CTY"].head(n).tolist()
+            if not rank_cty.empty:
+                keep_map = {src: _keep_list(g, top_countries) for src, g in rank_cty.groupby("__SRC")}
+            else:
+                keep_map = {}
+        else:
+            keep_map = {}
+
+        rows = []
+        for per in lb_months:
+            ms = date(per.year, per.month, 1)
+            ml = monthrange(per.year, per.month)[1]
+            me = date(per.year, per.month, ml)
+
+            # Creates and payments in this lookback month
+            c_mask = d["__C"].dt.date.between(ms, me)
+            p_mask = d["__P"].dt.date.between(ms, me)
+
+            # SAME (M0): created in month & paid in the same month
+            same_mask = p_mask & (P_per == per) & (C_per == per)
+            # PREV (carry-in): paid in month but created before month
+            prev_mask = p_mask & (C_per < per)
+
+            # Per Source × Country
+            grp_cols = ["__SRC","__CTY"]
+            creates = d.loc[c_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("Creates").reset_index()
+            same    = d.loc[same_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("SamePaid").reset_index()
+            prev    = d.loc[prev_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("PrevPaid").reset_index()
+
+            g = creates.merge(same, on=grp_cols, how="outer").merge(prev, on=grp_cols, how="outer").fillna(0)
+            g["per"] = str(per)
+
+            # filter to top countries per source if applicable
+            if _cty and keep_map:
+                g = g[g.apply(lambda r: (r["__CTY"] in keep_map.get(r["__SRC"], [r["__CTY"]])), axis=1)]
+
+            rows.append(g)
+
+        hist = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["__SRC","__CTY","Creates","SamePaid","PrevPaid","per"])
+        if hist.empty:
+            st.info("No lookback history. Increase lookback or check data.")
+            return
+
+        # Aggregate over lookback months
+        agg = (hist.groupby(["__SRC","__CTY"], dropna=False)[["Creates","SamePaid","PrevPaid"]]
+                    .sum().reset_index())
+        # Rates:
+        #   M0_Rate = SamePaid / Creates (over lookback)
+        #   MN_Avg  = PrevPaid / lookback_months (avg monthly carry-in to expect)
+        agg["M0_Rate"] = np.where(agg["Creates"] > 0, agg["SamePaid"] / agg["Creates"], 0.0)
+        agg["MN_Avg"]  = agg["PrevPaid"] / float(lookback)
+
+        # ---------- Planner inputs ----------
+        st.markdown("### Planner — Enter Planned Creates by Source (auto-allocates by country share)")
+        # Source picker with 'All' (shows only sources present in hist)
+        sources_all = sorted(agg["__SRC"].unique().tolist())
+        pick_src = st.multiselect("Pick Source(s)", options=["All"] + sources_all, default=["All"])
+        if "All" in pick_src or not pick_src:
+            pick_src = sources_all
+
+        # Planned creates per source
+        plan_cols = st.columns(min(4, max(1, len(pick_src))))
+        planned_by_src = {}
+        for i, src in enumerate(pick_src):
+            with plan_cols[i % len(plan_cols)]:
+                planned_by_src[src] = st.number_input(f"Planned Creates — {src}", min_value=0, value=0, step=1, key=f"plan_{src}")
+
+        # Historical country share per source (by lookback creates)
+        share = (
+            hist.groupby(["__SRC","__CTY"])["Creates"].sum().rename("C").reset_index()
+        )
+        # If no creates, fallback to enrolments as proxy
+        if share["C"].sum() == 0:
+            share = (hist.groupby(["__SRC","__CTY"])["SamePaid"].sum().rename("C").reset_index())
+
+        # Build line items (Source × Country within chosen sources)
+        lines = agg[agg["__SRC"].isin(pick_src)].copy()
+        lines = lines.merge(share, on=["__SRC","__CTY"], how="left")
+        # Normalized share within source
+        lines["C"] = lines["C"].fillna(0.0)
+        src_tot = lines.groupby("__SRC")["C"].transform(lambda s: s.sum() if s.sum() > 0 else np.nan)
+        lines["Share"] = np.where(src_tot.notna(), np.where(src_tot>0, lines["C"] / src_tot, 0.0), 1.0 / lines.groupby("__SRC")["__CTY"].transform("count"))
+
+        # Allocation of planned creates to lines
+        lines["PlannedDeals_Line"] = lines.apply(lambda r: planned_by_src.get(r["__SRC"], 0) * r["Share"], axis=1)
+
+        # Expected Enrolments per line (M0 + carry-in)
+        lines["Expected_Enrolments_Line"] = lines["PlannedDeals_Line"] * lines["M0_Rate"] + lines["MN_Avg"]
+
+        # Keep a helper for fallback weighting later
+        lines["HistCreates"] = lines["C"].astype(float)
+
+        # ---------- Actual so far (in scope) ----------
+        st.markdown("### Actual so far (for context)")
+        c_mask_win = d["__C"].dt.date.between(mstart, mend)
+        p_mask_win = d["__P"].dt.date.between(mstart, mend)
+        if mode == "MTD":
+            paid_now = int((c_mask_win & p_mask_win).sum())
+        else:
+            paid_now = int(p_mask_win.sum())
+        created_now = int(c_mask_win.sum())
+        conv_now = (paid_now / created_now * 100.0) if created_now > 0 else np.nan
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Creates (scope)", f"{created_now:,}")
+        k2.metric("Enrolments (scope)", f"{paid_now:,}")
+        k3.metric("Conv% (scope)", "–" if np.isnan(conv_now) else f"{conv_now:.1f}%")
+
+        # ---------- Totals for plan ----------
+        st.markdown("### Totals (Plan)")
+        tA, tB = st.columns(2)
+        with tA:
+            plan_creates_total = float(sum(planned_by_src.values()))
+            st.metric("Planned Creates (total)", f"{plan_creates_total:,.0f}")
+        with tB:
+            exp_total = float(lines["Expected_Enrolments_Line"].sum())
+            st.metric("Expected Enrolments (M0 + carry-in)", f"{exp_total:,.1f}")
+
+        # ---------- Line-item Planner table & chart ----------
+        st.markdown("### Line-item Planner — by Source × Country (Top-N)")
+        # Choose N lines to display (largest expected)
+        show_n = st.number_input("Show top N lines", min_value=5, max_value=500, value=50, step=5)
+        line_rows = lines.sort_values("Expected_Enrolments_Line", ascending=False).head(int(show_n))
+
+        # Table
+        nice = line_rows.rename(columns={
+            "__SRC":"Source","__CTY":"Country",
+            "M0_Rate":"M0 Rate",
+            "MN_Avg":"Avg carry-in (per month)",
+            "PlannedDeals_Line":"Planned Deals",
+            "Expected_Enrolments_Line":"Expected Enrolments"
+        }).copy()
+        for c in ["M0 Rate"]:
+            nice[c] = (nice[c].astype(float) * 100).round(1)
+        for c in ["Avg carry-in (per month)","Planned Deals","Expected Enrolments"]:
+            nice[c] = nice[c].astype(float).round(2)
+
+        st.dataframe(nice[["Source","Country","Planned Deals","M0 Rate","Avg carry-in (per month)","Expected Enrolments"]],
+                     use_container_width=True)
+
+        # Chart
+        ch = (
+            alt.Chart(line_rows)
+            .mark_circle(size=200, opacity=0.7)
+            .encode(
+                x=alt.X("M0_Rate:Q", title="M0 Rate", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, max(0.01, float(line_rows["M0_Rate"].max())*1.05)])),
+                y=alt.Y("Expected_Enrolments_Line:Q", title="Expected Enrolments"),
+                size=alt.Size("PlannedDeals_Line:Q", title="Planned Deals"),
+                color=alt.Color("__SRC:N", title="Source", legend=alt.Legend(orient="bottom")),
+                tooltip=[
+                    alt.Tooltip("__SRC:N", title="Source"),
+                    alt.Tooltip("__CTY:N", title="Country"),
+                    alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals", format=".1f"),
+                    alt.Tooltip("M0_Rate:Q", title="M0 Rate", format=".1%"),
+                    alt.Tooltip("MN_Avg:Q", title="Avg carry-in", format=".2f"),
+                    alt.Tooltip("Expected_Enrolments_Line:Q", title="Expected Enrolments", format=".2f"),
+                ]
+            )
+            .properties(height=420, title="Bubble view — Expected Enrolments vs M0 Rate (size = Planned Deals)")
+        )
+        st.altair_chart(ch, use_container_width=True)
+
+        # ---------- NEW: Mix Effect — Plan vs Baseline (MTD mix) ----------
+        # (From our previous discussion; appended with no changes to above logic)
+        if len(line_rows) > 0:
+            st.markdown("---")
+            st.markdown("### Mix Effect — Impact of Lead Mix on Expected Enrolments (Plan vs Baseline)")
+
+            total_planned_deals = float(lines["PlannedDeals_Line"].sum())
+
+            # Build MTD create mix (Source × Country) in current month
+            mtd_create_mask = d["__C"].dt.date.between(mstart, today_d)
+            grp_cols = ["__SRC","__CTY"]
+            mtd_mix = (
+                d.loc[mtd_create_mask, grp_cols]
                  .assign(_ones=1)
                  .groupby(grp_cols, dropna=False)["_ones"].sum()
                  .reset_index()
-        )
-
-        # Create a key to align with "lines" (Source × Country)
-        if _cty:
-            mtd_mix["__key"] = mtd_mix["__SRC"].astype(str).str.strip() + "||" + mtd_mix["__CTY"].astype(str).str.strip()
-            lines["__key"] = lines["Source"].astype(str).str.strip() + "||" + lines["Country"].astype(str).str.strip()
-        else:
-            mtd_mix["__key"] = mtd_mix["__SRC"].astype(str).str.strip()
-            lines["__key"] = lines["Source"].astype(str).str.strip()
-
-        # Baseline weights from MTD mix (fallback to historical create mix when empty)
-        if mtd_mix.empty or mtd_mix["_ones"].sum() == 0:
-            st.info("No creates so far this month; baseline mix falls back to the historical mix used in the planner.")
-            denom = float(lines["HistCreates"].sum())
-            if denom > 0:
-                base_weights = (lines["HistCreates"] / denom).fillna(0.0)
-            else:
-                base_weights = pd.Series(1.0 / max(len(lines), 1), index=lines.index)
-        else:
-            w = (
-                mtd_mix.set_index("__key")["_ones"]
-                       .reindex(lines["__key"])
-                       .fillna(0.0)
             )
-            if w.sum() > 0:
-                base_weights = w / w.sum()
-            else:
+
+            # Keys for alignment
+            lines["__key"] = lines["__SRC"].astype(str).str.strip() + "||" + lines["__CTY"].astype(str).str.strip()
+            if not mtd_mix.empty:
+                mtd_mix["__key"] = mtd_mix["__SRC"].astype(str).str.strip() + "||" + mtd_mix["__CTY"].astype(str).str.strip()
+
+            # Baseline weights
+            if mtd_mix.empty or mtd_mix["_ones"].sum() == 0:
+                st.info("No creates so far this month; baseline mix falls back to historical mix used above.")
                 denom = float(lines["HistCreates"].sum())
-                base_weights = (lines["HistCreates"] / denom).fillna(0.0) if denom > 0 else pd.Series(1.0 / max(len(lines),1), index=lines.index)
+                if denom > 0:
+                    base_weights = (lines["HistCreates"] / denom).fillna(0.0)
+                else:
+                    base_weights = pd.Series(1.0 / max(len(lines), 1), index=lines.index)
+            else:
+                w = mtd_mix.set_index("__key")["_ones"].reindex(lines["__key"]).fillna(0.0)
+                if w.sum() > 0:
+                    base_weights = w / w.sum()
+                else:
+                    denom = float(lines["HistCreates"].sum())
+                    base_weights = (lines["HistCreates"] / denom).fillna(0.0) if denom > 0 else pd.Series(1.0 / max(len(lines),1), index=lines.index)
 
-        # Baseline allocation & expected enrolments (holding quality constant)
-        lines["Baseline_PlannedDeals"] = total_planned_deals * base_weights.values
-        lines["Baseline_Expected"] = lines["Baseline_PlannedDeals"] * lines["M0_Rate"] + lines["MN_Avg"]
+            # Baseline allocation & expected
+            lines["Baseline_PlannedDeals"] = total_planned_deals * base_weights.values
+            lines["Baseline_Expected"] = lines["Baseline_PlannedDeals"] * lines["M0_Rate"] + lines["MN_Avg"]
 
-        # Deltas (Plan − Baseline)
-        lines["Delta_Deals"] = lines["PlannedDeals_Line"] - lines["Baseline_PlannedDeals"]
-        lines["Delta_Expected_Enrol"] = lines["Expected_Enrolments_Line"] - lines["Baseline_Expected"]
+            # Deltas
+            lines["Delta_Deals"] = lines["PlannedDeals_Line"] - lines["Baseline_PlannedDeals"]
+            lines["Delta_Expected_Enrol"] = lines["Expected_Enrolments_Line"] - lines["Baseline_Expected"]
 
-        # Summary KPI
-        plan_total = float(lines["Expected_Enrolments_Line"].sum())
-        base_total = float(lines["Baseline_Expected"].sum())
-        delta_total = plan_total - base_total
+            plan_total = float(lines["Expected_Enrolments_Line"].sum())
+            base_total = float(lines["Baseline_Expected"].sum())
+            delta_total = plan_total - base_total
 
-        st.metric(
-            "Δ Expected Enrolments (Plan – Baseline mix)",
-            f"{delta_total:+.1f}",
-            help=(
-                "Positive implies your planned lead mix is expected to yield more enrolments "
-                "than the current MTD create mix, holding per-line quality (M0 rate & carry-in) constant."
-            )
-        )
+            st.metric("Δ Expected Enrolments (Plan – Baseline mix)", f"{delta_total:+.1f}")
 
-        # Detail table
-        with st.expander("Detail — Plan vs Baseline mix (per line)"):
-            det = lines[[
-                "Source","Country",
-                "PlannedDeals_Line","Baseline_PlannedDeals","Delta_Deals",
-                "Expected_Enrolments_Line","Baseline_Expected","Delta_Expected_Enrol"
-            ]].copy()
+            with st.expander("Detail — Plan vs Baseline mix (per line)"):
+                det = lines[[
+                    "__SRC","__CTY",
+                    "PlannedDeals_Line","Baseline_PlannedDeals","Delta_Deals",
+                    "Expected_Enrolments_Line","Baseline_Expected","Delta_Expected_Enrol"
+                ]].rename(columns={
+                    "__SRC":"Source","__CTY":"Country",
+                    "PlannedDeals_Line":"Planned Deals",
+                    "Baseline_PlannedDeals":"Baseline Deals",
+                    "Delta_Deals":"Δ Deals",
+                    "Expected_Enrolments_Line":"Planned Expected Enrolments",
+                    "Baseline_Expected":"Baseline Expected Enrolments",
+                    "Delta_Expected_Enrol":"Δ Expected Enrolments"
+                }).copy()
 
-            # Friendly formatting
-            det.rename(columns={
-                "PlannedDeals_Line": "Planned Deals",
-                "Baseline_PlannedDeals": "Baseline Deals",
-                "Delta_Deals": "Δ Deals",
-                "Expected_Enrolments_Line": "Planned Expected Enrolments",
-                "Baseline_Expected": "Baseline Expected Enrolments",
-                "Delta_Expected_Enrol": "Δ Expected Enrolments"
-            }, inplace=True)
+                for c in ["Planned Deals","Baseline Deals","Δ Deals",
+                          "Planned Expected Enrolments","Baseline Expected Enrolments","Δ Expected Enrolments"]:
+                    det[c] = det[c].astype(float).round(2)
 
-            num_cols = ["Planned Deals","Baseline Deals","Δ Deals",
-                        "Planned Expected Enrolments","Baseline Expected Enrolments","Δ Expected Enrolments"]
-            for c in num_cols:
-                det[c] = det[c].astype(float).round(2)
+                st.dataframe(det.sort_values("Δ Expected Enrolments", ascending=False), use_container_width=True)
+                st.download_button("Download CSV — Mix Effect detail",
+                                   det.to_csv(index=False).encode("utf-8"),
+                                   "mix_effect_plan_vs_baseline.csv", "text/csv",
+                                   key="mix_eff_dl")
 
-            st.dataframe(
-                det.sort_values("Δ Expected Enrolments", ascending=False),
-                use_container_width=True
-            )
-            st.download_button(
-                "Download CSV — Mix Effect detail",
-                det.to_csv(index=False).encode("utf-8"),
-                "mix_effect_plan_vs_baseline.csv", "text/csv",
-                key="mix_eff_dl"
-            )
-
-        # Optional chart of mix impact by line
-        chart_on = st.radio("Visualize line-item mix impact?", ["No","Yes"], index=0, horizontal=True, key="mix_eff_chart_toggle")
-        if chart_on == "Yes":
-            top_lines = lines.sort_values("Delta_Expected_Enrol", ascending=False)
-            top_lines = pd.concat([top_lines.head(15), top_lines.tail(15)]) if len(top_lines) > 30 else top_lines
-            ch = (
-                alt.Chart(top_lines)
-                .mark_bar()
-                .encode(
-                    x=alt.X("Delta_Expected_Enrol:Q", title="Δ Expected Enrolments (Plan – Baseline)"),
-                    y=alt.Y("Country:N", sort="-x", title="Country"),
-                    color=alt.Color("Source:N", legend=alt.Legend(orient="bottom")),
-                    tooltip=[
-                        alt.Tooltip("Source:N"),
-                        alt.Tooltip("Country:N"),
-                        alt.Tooltip("Delta_Expected_Enrol:Q", title="Δ Expected Enrolments", format=".2f"),
-                        alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals", format=".1f"),
-                        alt.Tooltip("Baseline_PlannedDeals:Q", title="Baseline Deals", format=".1f")
-                    ]
+            chart_on = st.radio("Visualize line-item mix impact?", ["No","Yes"], index=0, horizontal=True, key="mix_eff_chart_toggle")
+            if chart_on == "Yes":
+                top_lines = lines.sort_values("Delta_Expected_Enrol", ascending=False)
+                top_lines = pd.concat([top_lines.head(15), top_lines.tail(15)]) if len(top_lines) > 30 else top_lines
+                ch2 = (
+                    alt.Chart(top_lines)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("Delta_Expected_Enrol:Q", title="Δ Expected Enrolments (Plan – Baseline)"),
+                        y=alt.Y("__CTY:N", sort="-x", title="Country"),
+                        color=alt.Color("__SRC:N", title="Source", legend=alt.Legend(orient="bottom")),
+                        tooltip=[
+                            alt.Tooltip("__SRC:N", title="Source"),
+                            alt.Tooltip("__CTY:N", title="Country"),
+                            alt.Tooltip("Delta_Expected_Enrol:Q", title="Δ Expected Enrolments", format=".2f"),
+                            alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals", format=".1f"),
+                            alt.Tooltip("Baseline_PlannedDeals:Q", title="Baseline Deals", format=".1f"),
+                        ]
+                    )
+                    .properties(height=420, title="Mix Effect — Which lines drive the difference?")
                 )
-                .properties(height=420, title="Mix Effect — Which lines drive the difference?")
-            )
-            st.altair_chart(ch, use_container_width=True)
+                st.altair_chart(ch2, use_container_width=True)
 
-
+    _mlpr_tab()
