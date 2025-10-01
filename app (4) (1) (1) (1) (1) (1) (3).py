@@ -7165,6 +7165,9 @@ elif view == "HubSpot Deal Score tracker":
 # =========================
 # Marketing Lead Performance & Requirement (FULL with Mix Effect)
 # =========================
+# =========================
+# Marketing Lead Performance & Requirement (FULL — per-source Top N country scope)
+# =========================
 elif view == "Marketing Lead Performance & Requirement":
     def _mlpr_tab():
         st.subheader("Marketing Lead Performance & Requirement")
@@ -7190,17 +7193,14 @@ elif view == "Marketing Lead Performance & Requirement":
             return
 
         # ---------- Controls ----------
-        c1, c2, c3, c4 = st.columns([1,1,1,1.2])
+        c1, c2, c3 = st.columns([1,1,1])
         with c1:
             scope = st.selectbox("Date scope", ["This month","Last month","Custom"], index=0)
         with c2:
             lookback = st.selectbox("Lookback (full months, excl. current)", [3, 6, 12], index=1)
         with c3:
-            mode = st.radio("Mode", ["Cohort","MTD"], index=0, horizontal=True,
-                            help="Affects 'Actual so far' comparison only (Cohort=payments in window; MTD=created & paid in window).")
-        with c4:
-            top_countries = st.selectbox("Country scope", ["Top 10","Top 20","All"], index=0,
-                                         help="Determines which countries are used for auto-allocation & rates.")
+            mode = st.radio("Mode for 'Actual so far'", ["Cohort","MTD"], index=0, horizontal=True,
+                            help="Cohort: payments in window; MTD: created & paid in window.")
 
         today_d = date.today()
         if scope == "This month":
@@ -7215,7 +7215,7 @@ elif view == "Marketing Lead Performance & Requirement":
                 st.error("End date cannot be before start date.")
                 return
 
-        st.caption(f"Scope: **{mstart} → {mend}** • Lookback: **{lookback}m** • Mode for actual: **{mode}**")
+        st.caption(f"Scope: **{mstart} → {mend}** • Lookback: **{lookback}m** • Mode: **{mode}**")
 
         # ---------- Prep dataframe ----------
         d = df_f.copy()
@@ -7234,58 +7234,31 @@ elif view == "Marketing Lead Performance & Requirement":
             st.info("No lookback months selected.")
             return
 
-        # ---------- Historical M0 and carry-in (M−N) by Source × Country ----------
         C_per = d["__C"].dt.to_period("M")
         P_per = d["__P"].dt.to_period("M")
 
-        # Determine top countries set (by lookback enrolments) per source
-        if _cty:
-            enrol_lb_mask = d["__P"].dt.to_period("M").isin(lb_months)
-            rank_cty = (
-                d.loc[enrol_lb_mask]
-                 .groupby(["__SRC","__CTY"]).size()
-                 .rename("cnt").reset_index()
-            )
-            def _keep_list(g, k):
-                g = g.sort_values("cnt", ascending=False)
-                if top_countries == "All": return g["__CTY"].tolist()
-                n = 10 if top_countries == "Top 10" else 20
-                return g["__CTY"].head(n).tolist()
-            if not rank_cty.empty:
-                keep_map = {src: _keep_list(g, top_countries) for src, g in rank_cty.groupby("__SRC")}
-            else:
-                keep_map = {}
-        else:
-            keep_map = {}
-
+        # ---------- Historical per-month aggregates across lookback ----------
         rows = []
         for per in lb_months:
             ms = date(per.year, per.month, 1)
             ml = monthrange(per.year, per.month)[1]
             me = date(per.year, per.month, ml)
 
-            # Creates and payments in this lookback month
             c_mask = d["__C"].dt.date.between(ms, me)
             p_mask = d["__P"].dt.date.between(ms, me)
 
-            # SAME (M0): created in month & paid in the same month
+            # SAME (M0): created in month & paid in same month
             same_mask = p_mask & (P_per == per) & (C_per == per)
             # PREV (carry-in): paid in month but created before month
             prev_mask = p_mask & (C_per < per)
 
-            # Per Source × Country
             grp_cols = ["__SRC","__CTY"]
             creates = d.loc[c_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("Creates").reset_index()
             same    = d.loc[same_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("SamePaid").reset_index()
-            prev    = d.loc[prev_mask, grp_cols].assign(_one=1).groupby(grp_cols)["_one"].sum().rename("PrevPaid").reset_index()
+            prev    = d.loc[prev_mask, grp_cols].assign(_one=1).groupby(grp_cols).size().rename("PrevPaid").reset_index()
 
             g = creates.merge(same, on=grp_cols, how="outer").merge(prev, on=grp_cols, how="outer").fillna(0)
             g["per"] = str(per)
-
-            # filter to top countries per source if applicable
-            if _cty and keep_map:
-                g = g[g.apply(lambda r: (r["__CTY"] in keep_map.get(r["__SRC"], [r["__CTY"]])), axis=1)]
-
             rows.append(g)
 
         hist = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["__SRC","__CTY","Creates","SamePaid","PrevPaid","per"])
@@ -7296,42 +7269,64 @@ elif view == "Marketing Lead Performance & Requirement":
         # Aggregate over lookback months
         agg = (hist.groupby(["__SRC","__CTY"], dropna=False)[["Creates","SamePaid","PrevPaid"]]
                     .sum().reset_index())
-        # Rates:
-        #   M0_Rate = SamePaid / Creates (over lookback)
-        #   MN_Avg  = PrevPaid / lookback_months (avg monthly carry-in to expect)
         agg["M0_Rate"] = np.where(agg["Creates"] > 0, agg["SamePaid"] / agg["Creates"], 0.0)
         agg["MN_Avg"]  = agg["PrevPaid"] / float(lookback)
 
-        # ---------- Planner inputs ----------
-        st.markdown("### Planner — Enter Planned Creates by Source (auto-allocates by country share)")
-        # Source picker with 'All' (shows only sources present in hist)
+        # ---------- Build per-source Top lists (Top 5 / Top 10 / All) ----------
+        # Rank countries by lookback enrolments (SamePaid + PrevPaid). Fallback to Creates.
+        rank_base = agg.copy()
+        rank_base["EnrollLike"] = rank_base["SamePaid"] + rank_base["PrevPaid"]
+        if (rank_base["EnrollLike"].sum() == 0) and (rank_base["Creates"].sum() > 0):
+            rank_base["EnrollLike"] = rank_base["Creates"]
+
+        top_lists = {}
+        for src, g in rank_base.groupby("__SRC"):
+            g = g.sort_values("EnrollLike", ascending=False)
+            all_c = g["__CTY"].tolist()
+            top5  = g.head(5)["__CTY"].tolist()
+            top10 = g.head(10)["__CTY"].tolist()
+            top_lists[src] = {"All": all_c, "Top 5": top5 or all_c, "Top 10": top10 or all_c}
+
+        # ---------- Planner inputs (per-source) ----------
+        st.markdown("### Planner — Enter Planned Creates and Country Scope per Source")
         sources_all = sorted(agg["__SRC"].unique().tolist())
         pick_src = st.multiselect("Pick Source(s)", options=["All"] + sources_all, default=["All"])
         if "All" in pick_src or not pick_src:
             pick_src = sources_all
 
-        # Planned creates per source
-        plan_cols = st.columns(min(4, max(1, len(pick_src))))
         planned_by_src = {}
+        scope_by_src   = {}
+        cols = st.columns(3)
         for i, src in enumerate(pick_src):
-            with plan_cols[i % len(plan_cols)]:
+            with cols[i % 3]:
                 planned_by_src[src] = st.number_input(f"Planned Creates — {src}", min_value=0, value=0, step=1, key=f"plan_{src}")
+                scope_by_src[src]   = st.selectbox(f"Country scope — {src}", ["Top 5","Top 10","All"], index=1, key=f"scope_{src}",
+                                                   help="Filters line items for this source to the chosen country subset.")
 
-        # Historical country share per source (by lookback creates)
-        share = (
-            hist.groupby(["__SRC","__CTY"])["Creates"].sum().rename("C").reset_index()
-        )
-        # If no creates, fallback to enrolments as proxy
-        if share["C"].sum() == 0:
-            share = (hist.groupby(["__SRC","__CTY"])["SamePaid"].sum().rename("C").reset_index())
-
-        # Build line items (Source × Country within chosen sources)
+        # ---------- Construct line items (Source × Country) & apply per-source scope ----------
         lines = agg[agg["__SRC"].isin(pick_src)].copy()
+
+        if not lines.empty:
+            def _row_keep(r):
+                src = r["__SRC"]
+                chosen = scope_by_src.get(src, "Top 10")
+                allowed = top_lists.get(src, {}).get(chosen, [r["__CTY"]])
+                return r["__CTY"] in allowed
+            lines = lines[lines.apply(_row_keep, axis=1)].copy()
+
+        # Historical share within source (based on lookback Creates; fallback to EnrollLike)
+        share = agg[agg["__SRC"].isin(pick_src)][["__SRC","__CTY","Creates"]].rename(columns={"Creates":"C"}).copy()
+        if share["C"].sum() == 0:
+            share = rank_base[rank_base["__SRC"].isin(pick_src)][["__SRC","__CTY","EnrollLike"]].rename(columns={"EnrollLike":"C"}).copy()
+
         lines = lines.merge(share, on=["__SRC","__CTY"], how="left")
-        # Normalized share within source
         lines["C"] = lines["C"].fillna(0.0)
         src_tot = lines.groupby("__SRC")["C"].transform(lambda s: s.sum() if s.sum() > 0 else np.nan)
-        lines["Share"] = np.where(src_tot.notna(), np.where(src_tot>0, lines["C"] / src_tot, 0.0), 1.0 / lines.groupby("__SRC")["__CTY"].transform("count"))
+        lines["Share"] = np.where(
+            src_tot.notna(),
+            np.where(src_tot > 0, lines["C"] / src_tot, 0.0),
+            1.0 / lines.groupby("__SRC")["__CTY"].transform("count")
+        )
 
         # Allocation of planned creates to lines
         lines["PlannedDeals_Line"] = lines.apply(lambda r: planned_by_src.get(r["__SRC"], 0) * r["Share"], axis=1)
@@ -7339,7 +7334,7 @@ elif view == "Marketing Lead Performance & Requirement":
         # Expected Enrolments per line (M0 + carry-in)
         lines["Expected_Enrolments_Line"] = lines["PlannedDeals_Line"] * lines["M0_Rate"] + lines["MN_Avg"]
 
-        # Keep a helper for fallback weighting later
+        # Keep helper for baseline mix later
         lines["HistCreates"] = lines["C"].astype(float)
 
         # ---------- Actual so far (in scope) ----------
@@ -7365,16 +7360,14 @@ elif view == "Marketing Lead Performance & Requirement":
             plan_creates_total = float(sum(planned_by_src.values()))
             st.metric("Planned Creates (total)", f"{plan_creates_total:,.0f}")
         with tB:
-            exp_total = float(lines["Expected_Enrolments_Line"].sum())
+            exp_total = float(lines["Expected_Enrolments_Line"].sum()) if not lines.empty else 0.0
             st.metric("Expected Enrolments (M0 + carry-in)", f"{exp_total:,.1f}")
 
         # ---------- Line-item Planner table & chart ----------
-        st.markdown("### Line-item Planner — by Source × Country (Top-N)")
-        # Choose N lines to display (largest expected)
+        st.markdown("### Line-item Planner — by Source × Country")
         show_n = st.number_input("Show top N lines", min_value=5, max_value=500, value=50, step=5)
         line_rows = lines.sort_values("Expected_Enrolments_Line", ascending=False).head(int(show_n))
 
-        # Table
         nice = line_rows.rename(columns={
             "__SRC":"Source","__CTY":"Country",
             "M0_Rate":"M0 Rate",
@@ -7390,37 +7383,37 @@ elif view == "Marketing Lead Performance & Requirement":
         st.dataframe(nice[["Source","Country","Planned Deals","M0 Rate","Avg carry-in (per month)","Expected Enrolments"]],
                      use_container_width=True)
 
-        # Chart
-        ch = (
-            alt.Chart(line_rows)
-            .mark_circle(size=200, opacity=0.7)
-            .encode(
-                x=alt.X("M0_Rate:Q", title="M0 Rate", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, max(0.01, float(line_rows["M0_Rate"].max())*1.05)])),
-                y=alt.Y("Expected_Enrolments_Line:Q", title="Expected Enrolments"),
-                size=alt.Size("PlannedDeals_Line:Q", title="Planned Deals"),
-                color=alt.Color("__SRC:N", title="Source", legend=alt.Legend(orient="bottom")),
-                tooltip=[
-                    alt.Tooltip("__SRC:N", title="Source"),
-                    alt.Tooltip("__CTY:N", title="Country"),
-                    alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals", format=".1f"),
-                    alt.Tooltip("M0_Rate:Q", title="M0 Rate", format=".1%"),
-                    alt.Tooltip("MN_Avg:Q", title="Avg carry-in", format=".2f"),
-                    alt.Tooltip("Expected_Enrolments_Line:Q", title="Expected Enrolments", format=".2f"),
-                ]
+        if not line_rows.empty:
+            ch = (
+                alt.Chart(line_rows)
+                .mark_circle(size=200, opacity=0.7)
+                .encode(
+                    x=alt.X("M0_Rate:Q", title="M0 Rate", axis=alt.Axis(format="%"),
+                            scale=alt.Scale(domain=[0, max(0.01, float(line_rows["M0_Rate"].max())*1.05)])),
+                    y=alt.Y("Expected_Enrolments_Line:Q", title="Expected Enrolments"),
+                    size=alt.Size("PlannedDeals_Line:Q", title="Planned Deals"),
+                    color=alt.Color("__SRC:N", title="Source", legend=alt.Legend(orient="bottom")),
+                    tooltip=[
+                        alt.Tooltip("__SRC:N", title="Source"),
+                        alt.Tooltip("__CTY:N", title="Country"),
+                        alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals", format=".1f"),
+                        alt.Tooltip("M0_Rate:Q", title="M0 Rate", format=".1%"),
+                        alt.Tooltip("MN_Avg:Q", title="Avg carry-in", format=".2f"),
+                        alt.Tooltip("Expected_Enrolments_Line:Q", title="Expected Enrolments", format=".2f"),
+                    ]
+                )
+                .properties(height=420, title="Bubble view — Expected Enrolments vs M0 Rate (size = Planned Deals)")
             )
-            .properties(height=420, title="Bubble view — Expected Enrolments vs M0 Rate (size = Planned Deals)")
-        )
-        st.altair_chart(ch, use_container_width=True)
+            st.altair_chart(ch, use_container_width=True)
 
-        # ---------- NEW: Mix Effect — Plan vs Baseline (MTD mix) ----------
-        # (From our previous discussion; appended with no changes to above logic)
-        if len(line_rows) > 0:
+        # ---------- Mix Effect — Plan vs Baseline (MTD create mix) ----------
+        if not lines.empty:
             st.markdown("---")
             st.markdown("### Mix Effect — Impact of Lead Mix on Expected Enrolments (Plan vs Baseline)")
 
             total_planned_deals = float(lines["PlannedDeals_Line"].sum())
 
-            # Build MTD create mix (Source × Country) in current month
+            # MTD create mix (Source × Country) in current month
             mtd_create_mask = d["__C"].dt.date.between(mstart, today_d)
             grp_cols = ["__SRC","__CTY"]
             mtd_mix = (
@@ -7430,7 +7423,6 @@ elif view == "Marketing Lead Performance & Requirement":
                  .reset_index()
             )
 
-            # Keys for alignment
             lines["__key"] = lines["__SRC"].astype(str).str.strip() + "||" + lines["__CTY"].astype(str).str.strip()
             if not mtd_mix.empty:
                 mtd_mix["__key"] = mtd_mix["__SRC"].astype(str).str.strip() + "||" + mtd_mix["__CTY"].astype(str).str.strip()
