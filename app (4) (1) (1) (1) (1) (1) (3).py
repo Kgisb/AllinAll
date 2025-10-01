@@ -7162,6 +7162,9 @@ elif view == "HubSpot Deal Score tracker":
 # ============================================================
 # Marketing Lead Performance & Requirement (updated with Traction)
 # ============================================================
+# ============================================================
+# Marketing Lead Performance & Requirement (updated with Traction + Line-item planner)
+# ============================================================
 elif view == "Marketing Lead Performance & Requirement":
     import pandas as pd, numpy as np
     import altair as alt
@@ -7235,25 +7238,24 @@ elif view == "Marketing Lead Performance & Requirement":
         d_use = d[d["__SRC"].isin(src_sel)].copy()
         sel_sources = src_sel
 
-    # Build masks for lookback window by month
     d_use["__in_hist"] = d_use["__Cper"].isin(hist_months)
 
     # Country top-N (by enrolments in lookback for selected sources)
     if _cty:
-        enrol_hist_mask = d_use["__Pper"].isin(hist_months) & d_use["__in_hist"]  # payment & created in lookback months (keep same cohort universe)
+        enrol_hist_mask = d_use["__Pper"].isin(hist_months) & d_use["__in_hist"]  # payment & created in lookback months
         cty_counts = (d_use.loc[enrol_hist_mask]
                          .groupby("__CTY").size().sort_values(ascending=False))
         if cty_scope == "Top 10 countries":
-            top_countries = cty_counts.head(10).index.tolist()
+            top_countries_scope = cty_counts.head(10).index.tolist()
         elif cty_scope == "Top 20 countries":
-            top_countries = cty_counts.head(20).index.tolist()
+            top_countries_scope = cty_counts.head(20).index.tolist()
         else:
-            top_countries = None
-        if top_countries is not None and len(top_countries) > 0:
-            d_use = d_use[d_use["__CTY"].isin(top_countries)].copy()
+            top_countries_scope = None
+        if top_countries_scope is not None and len(top_countries_scope) > 0:
+            d_use = d_use[d_use["__CTY"].isin(top_countries_scope)].copy()
     # else: no country column -> do nothing
 
-    # --------- learn M0 rate and M–N carry-in (per month) ----------
+    # --------- learn M0 rate and M–N carry-in (aggregate, for KPI/planner) ----------
     rows = []
     for m in hist_months:
         dc = int((d_use["__Cper"] == m).sum())
@@ -7325,16 +7327,13 @@ elif view == "Marketing Lead Performance & Requirement":
 
     st.markdown("---")
 
-    # --------- NEW: This Month So Far — Traction ----------
+    # --------- This Month So Far — Traction ----------
     st.markdown("### This Month So Far — Traction")
-    # Created so far (1..today)
     created_so_far = int((d_use["__C"].dt.date.between(mstart, today_d)).sum())
-    # Payments so far (1..today) split into same-month vs carry-in
     same_to_date = int(((d_use["__P"].dt.date.between(mstart, today_d)) & (d_use["__Cper"] == cur_per)).sum())
     prev_to_date = int(((d_use["__P"].dt.date.between(mstart, today_d)) & (d_use["__Cper"] <  cur_per)).sum())
     total_to_date = same_to_date + prev_to_date
 
-    # Pace-adjusted expectations for same & carry-in up to today
     exp_same_to_date = created_so_far * avg_m0_rate * elapsed_frac
     exp_prev_to_date = avg_mn_cnt * elapsed_frac
     exp_total_to_date = exp_same_to_date + exp_prev_to_date
@@ -7353,28 +7352,23 @@ elif view == "Marketing Lead Performance & Requirement":
         st.metric("Total Enrolments (so far)", f"{total_to_date:,}",
                   delta=f"exp {exp_total_to_date:.1f}")
 
-    # Quick diagnostic text
     msgs = []
-    # Quality: compare same-to-date rate vs avg
     same_rate_so_far = (same_to_date / created_so_far) if created_so_far > 0 else 0.0
     if created_so_far > 0:
         if same_rate_so_far + 1e-9 < 0.9 * avg_m0_rate:
-            msgs.append("**Quality lag:** Same-month conversion rate is trailing lookback average. Consider improving lead quality/nurture.")
+            msgs.append("**Quality lag:** Same-month conversion rate is trailing lookback average.")
         elif same_rate_so_far > 1.1 * avg_m0_rate:
             msgs.append("**Quality strong:** Same-month conversion rate is exceeding the lookback average.")
-    # Quantity: if target exists, check pace
     if target_enrol > 0 and avg_m0_rate > 0:
         on_pace_deals_by_today = (max(0.0, target_enrol - avg_mn_cnt) / avg_m0_rate) * elapsed_frac
         if created_so_far + 1e-9 < 0.9 * on_pace_deals_by_today:
-            msgs.append("**Quantity lag:** Deals created are behind pace vs target; consider adding volume.")
+            msgs.append("**Quantity lag:** Deals are behind pace vs target.")
         elif created_so_far > 1.1 * on_pace_deals_by_today:
-            msgs.append("**Quantity strong:** Deals created are ahead of pace vs target.")
+            msgs.append("**Quantity strong:** Deals are ahead of pace vs target.")
     if not msgs:
         msgs.append("Trajectory looks **on-pace** versus learned averages for this month-to-date.")
-
     st.info(" • ".join(msgs))
 
-    # Small comparison chart (actual vs expected to date)
     comp_df = pd.DataFrame({
         "Component": ["Same-month", "Carry-in", "Total"],
         "Actual": [same_to_date, prev_to_date, total_to_date],
@@ -7395,7 +7389,7 @@ elif view == "Marketing Lead Performance & Requirement":
 
     st.markdown("---")
 
-    # --------- Visual: historical composition (M0 vs M–N) ----------
+    # --------- Historical Composition (lookback) ----------
     st.markdown("### Historical Composition (lookback)")
     if not hist_tbl.empty:
         hist_plot = hist_tbl.melt(id_vars=["Month"], value_vars=["M0_Enrol","MN_Enrol"],
@@ -7420,7 +7414,7 @@ elif view == "Marketing Lead Performance & Requirement":
     else:
         st.info("No data in the chosen lookback for selected filters.")
 
-    # --------- Per-source details (same filters & country scope) ----------
+    # --------- Per-source details (for the selected filters) ----------
     st.markdown("### Per-Source Details (for the selected filters)")
     per_rows = []
     for s in sel_sources:
@@ -7454,4 +7448,123 @@ elif view == "Marketing Lead Performance & Requirement":
     else:
         st.info("No per-source details to show with current filters.")
 
+    # -----------------------------------------------------------
+    # NEW: Line-item Planner — by Source × Country (Top-N)
+    # -----------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### Line-item Planner — by Source × Country (Top-N)")
+
+    if not _cty:
+        st.info("Country column not found. Line-item planner collapses to per-source (no country split).")
+        top_n = 0
+    else:
+        top_n = st.number_input("Top N countries per source", min_value=1, max_value=50, value=10, step=1)
+
+    line_rows = []
+    for s in sel_sources:
+        ds_src = d_use if s in ("All",) else d_use[d_use["__SRC"] == s]
+
+        if _cty:
+            # Build per-month stats per country
+            c_stats = []
+            for m in hist_months:
+                ms = (ds_src["__Cper"] == m)
+                pm = (ds_src["__Pper"] == m)
+                # All countries present in this source
+                for ctry in ds_src["__CTY"].dropna().unique():
+                    mask_cty = (ds_src["__CTY"] == ctry)
+                    dc = int((ms & mask_cty).sum())
+                    m0 = int(((ms & mask_cty) & (ds_src["__Pper"] == m)).sum())
+                    mn = int(((pm & mask_cty) & (ds_src["__Cper"] < m)).sum())
+                    c_stats.append({"Country": ctry, "Month": str(m), "DealsCreated": dc,
+                                    "M0_Enrol": m0, "MN_Enrol": mn})
+            if not c_stats:
+                continue
+            cs = pd.DataFrame(c_stats)
+
+            # Aggregate over months
+            agg = cs.groupby("Country", as_index=False).agg(
+                HistCreates=("DealsCreated","sum"),
+                M0_Enrol=("M0_Enrol","sum"),
+                MN_Avg=("MN_Enrol","mean")
+            )
+            agg["M0_Rate"] = np.where(agg["HistCreates"] > 0, agg["M0_Enrol"] / agg["HistCreates"], 0.0)
+            # Choose Top-N by historical enrolments (M0 + MN average proxy)
+            agg["RankKey"] = agg["M0_Enrol"] + agg["MN_Avg"]
+            agg = agg.sort_values("RankKey", ascending=False)
+            if top_n and top_n > 0:
+                agg = agg.head(top_n)
+
+            # Allocation of planned deals across countries by historical create mix
+            total_hist_creates = agg["HistCreates"].sum()
+            if total_hist_creates > 0 and planned_deals > 0:
+                alloc = planned_deals * (agg["HistCreates"] / total_hist_creates)
+            else:
+                # fallback equal split if no history
+                n = max(len(agg), 1)
+                alloc = pd.Series(planned_deals / n, index=agg.index)
+
+            agg["PlannedDeals_Line"] = alloc
+            agg["Expected_Enrolments_Line"] = agg["PlannedDeals_Line"] * agg["M0_Rate"] + agg["MN_Avg"]
+            agg["Source"] = s
+
+            line_rows.append(agg[["Source","Country","HistCreates","M0_Rate","MN_Avg","PlannedDeals_Line","Expected_Enrolments_Line"]])
+
+        else:
+            # No country column -> one line per source
+            rows = []
+            for m in hist_months:
+                dc = int((ds_src["__Cper"] == m).sum())
+                m0 = int(((ds_src["__Cper"] == m) & (ds_src["__Pper"] == m)).sum())
+                mn = int(((ds_src["__Pper"] == m) & (ds_src["__Cper"] < m)).sum())
+                rows.append((dc, m0, mn))
+            if not rows:
+                continue
+            tmp = pd.DataFrame(rows, columns=["DealsCreated","M0_Enrol","MN_Enrol"])
+            dc_sum = tmp["DealsCreated"].sum()
+            m0_sum = tmp["M0_Enrol"].sum()
+            mn_avg = tmp["MN_Enrol"].mean()
+            m0_rate = (m0_sum / dc_sum) if dc_sum > 0 else 0.0
+
+            planned_line = planned_deals  # single line when no country split
+            exp_line = planned_line * m0_rate + mn_avg
+            line_rows.append(pd.DataFrame([{
+                "Source": s, "Country": "All", "HistCreates": dc_sum,
+                "M0_Rate": m0_rate, "MN_Avg": mn_avg,
+                "PlannedDeals_Line": planned_line, "Expected_Enrolments_Line": exp_line
+            }]))
+
+    if line_rows:
+        lines = pd.concat(line_rows, ignore_index=True)
+        # Display table
+        show = lines.copy()
+        show["M0_Rate"] = (show["M0_Rate"] * 100.0).round(2)
+        show.rename(columns={"M0_Rate":"M0 Rate (%)","MN_Avg":"MN Carry-in (avg)","PlannedDeals_Line":"Planned Deals","Expected_Enrolments_Line":"Expected Enrolments"}, inplace=True)
+        st.dataframe(show.sort_values(["Source","Expected Enrolments"], ascending=[True, False]), use_container_width=True)
+        st.download_button("Download CSV — Line items", show.to_csv(index=False).encode("utf-8"),
+                           "line_item_planner_source_country.csv","text/csv")
+
+        # Optional bar chart
+        chart_mode = st.radio("Line-item view", ["Chart","None"], index=0, horizontal=True, key="mlpr_chartmode")
+        if chart_mode == "Chart":
+            ch_df = lines.sort_values("Expected_Enrolments_Line", ascending=False).head(50)
+            ch = (
+                alt.Chart(ch_df)
+                .mark_bar(opacity=0.9)
+                .encode(
+                    x=alt.X("Expected_Enrolments_Line:Q", title="Expected Enrolments"),
+                    y=alt.Y("Country:N", sort="-x", title="Country"),
+                    color=alt.Color("Source:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=["Source","Country",
+                             alt.Tooltip("HistCreates:Q", title="Hist Creates"),
+                             alt.Tooltip("M0_Rate:Q", title="M0 Rate", format=".2%"),
+                             alt.Tooltip("MN_Avg:Q", title="MN Avg"),
+                             alt.Tooltip("PlannedDeals_Line:Q", title="Planned Deals"),
+                             alt.Tooltip("Expected_Enrolments_Line:Q", title="Expected Enrolments")]
+                )
+                .properties(height=420, title="Expected Enrolments by Source × Country (Top-N)")
+            )
+            st.altair_chart(ch, use_container_width=True)
+    else:
+        st.info("No line-item rows with the current filters/lookback.")
 
