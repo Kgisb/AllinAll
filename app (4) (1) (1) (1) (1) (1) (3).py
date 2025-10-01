@@ -6969,278 +6969,195 @@ elif view == "Cash-in":
             st.error(f"Error parsing A2:D13: {e}")
 # =========================
 # =========================
-# HubSpot Deal Score tracker (normalized month-on-month)
-# =========================
+# =========================================
+# HubSpot Deal Score tracker (fresh build)
+# =========================================
 elif view == "HubSpot Deal Score tracker":
-    import pandas as pd
-    import numpy as np
+    import pandas as pd, numpy as np
     import altair as alt
     from datetime import date, timedelta
     from calendar import monthrange
 
-    st.subheader("HubSpot Deal Score — Normalized Cohort Trend (MTD / Cohort)")
+    st.subheader("HubSpot Deal Score tracker — Score Calibration & Month Prediction")
 
     # ---------- Helpers ----------
-    def _find_col(df, choices):
-        for c in choices:
-            if c in df.columns:
-                return c
+    def _pick(df, preferred, cands):
+        if preferred and preferred in df.columns: return preferred
+        for c in cands:
+            if c in df.columns: return c
         return None
 
-    # Try mapped columns first; then fall back to common aliases
-    _create = create_col if (create_col in df_f.columns) else _find_col(df_f, [
-        "Create Date","Created Date","Deal Create Date","CreateDate","Created On"
-    ])
-    _pay    = pay_col    if (pay_col    in df_f.columns) else _find_col(df_f, [
-        "Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"
-    ])
-    _score  = _find_col(df_f, [
-        "HubSpot Deal Score","Deal Score","HubSpot Score","HSDLS Code","HSDLS","HSDLS Score","HSDLS_Code"
-    ])
+    def month_bounds(d: date):
+        return date(d.year, d.month, 1), date(d.year, d.month, monthrange(d.year, d.month)[1])
 
-    if not _create or _create not in df_f.columns:
-        st.warning("Tracker needs a valid **Create Date** column.", icon="⚠️")
+    # ---------- Resolve columns ----------
+    _create = _pick(df_f, globals().get("create_col"),
+                    ["Create Date","Created Date","Deal Create Date","CreateDate","Created On"])
+    _pay    = _pick(df_f, globals().get("pay_col"),
+                    ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
+    _score  = _pick(df_f, None,
+                    ["HubSpot Deal Score","HubSpot DLSCore","HubSpot DLS Score","Deal Score","HubSpot Score","DLSCore"])
+
+    if not _create or not _pay or not _score:
+        st.warning("Need columns: Create Date, Payment Received Date, and HubSpot Deal Score. Please map them.", icon="⚠️")
         st.stop()
-    if not _score or _score not in df_f.columns:
-        st.warning("Tracker needs a **HubSpot Deal Score** column.", icon="⚠️")
-        st.stop()
+
+    dfm = df_f.copy()
+    dfm["__C"] = pd.to_datetime(dfm[_create], errors="coerce", dayfirst=True)
+    dfm["__P"] = pd.to_datetime(dfm[_pay],    errors="coerce", dayfirst=True)
+    dfm["__S"] = pd.to_numeric(dfm[_score], errors="coerce")  # score as float
+
+    has_score = dfm["__S"].notna()
 
     # ---------- Controls ----------
-    col1, col2, col3 = st.columns([1.05, 1.2, 1.2])
-    with col1:
-        mode = st.radio(
-            "Mode",
-            ["MTD", "Cohort"],
-            index=1,
-            horizontal=True,
-            help=(
-                "MTD: restrict cohorts to deals created in the selected window; "
-                "Cohort: analyze by payment month window (normalization is still by Create Month)."
-            ),
-            key="hsdeal_mode"
-        )
-    with col2:
-        scope = st.radio(
-            "Date scope",
-            ["This month", "Last month", "Custom"],
-            index=0,
-            horizontal=True,
-            key="hsdeal_dscope"
-        )
-    with col3:
-        eval_age = st.selectbox(
-            "Normalization age (days)",
-            [7, 14, 30, 45, 60, 90],
-            index=2,
-            help="Compare cohorts at a consistent lead age to remove recency bias.",
-            key="hsdeal_eval_age"
-        )
+    c1, c2, c3 = st.columns([1.1, 1.1, 1.2])
+    with c1:
+        lookback = st.selectbox("Lookback (months, exclude current)", [3, 6, 9, 12], index=1)
+    with c2:
+        n_bins = st.selectbox("# Score bins", [6, 8, 10, 12, 15], index=2)
+    with c3:
+        ref_age_days = st.number_input("Normalization age (days)", min_value=7, max_value=120, value=30, step=1,
+                                       help="Young deals have lower scores; normalize each score up to this age (cap at 1×).")
 
+    # Current month scope
     today_d = date.today()
-    if scope == "This month":
-        start_d, end_d = date(today_d.year, today_d.month, 1), date(today_d.year, today_d.month, monthrange(today_d.year, today_d.month)[1])
-    elif scope == "Last month":
-        prev_m = (today_d.replace(day=1) - timedelta(days=1))
-        start_d, end_d = date(prev_m.year, prev_m.month, 1), date(prev_m.year, prev_m.month, monthrange(prev_m.year, prev_m.month)[1])
-    else:
-        c1, c2 = st.columns(2)
-        with c1:
-            start_d = st.date_input("Start date", value=today_d.replace(day=1), key="hsdeal_start")
-        with c2:
-            end_d   = st.date_input("End date", value=today_d, key="hsdeal_end")
-        if end_d < start_d:
-            st.error("End date cannot be before start date.")
-            st.stop()
-
-    st.caption(f"Scope: **{scope}** ({start_d} → {end_d}) • Mode: **{mode}** • Normalization age **{eval_age} days**")
-
-    # Optional slicers (multi-select with “All”)
-    def _prefer(existing_name, fallback_list):
-        if existing_name and existing_name in df_f.columns:
-            return existing_name
-        return _find_col(df_f, fallback_list)
-
-    dim1 = _prefer(country_col if 'country_col' in globals() else None, ["Country","Student Country","Deal Country"])
-    dim2 = _prefer(source_col  if 'source_col'  in globals() else None, ["JetLearn Deal Source","Deal Source","Source"])
-
-    f1, f2 = st.columns([1.2, 1.2])
-    with f1:
-        if dim1:
-            d1_vals = sorted(df_f[dim1].fillna("Unknown").astype(str).unique().tolist())
-            d1_sel = st.multiselect(f"Filter {dim1}", options=["All"] + d1_vals, default=["All"], key="hsdeal_fdim1")
-        else:
-            d1_sel = ["All"]
-    with f2:
-        if dim2:
-            d2_vals = sorted(df_f[dim2].fillna("Unknown").astype(str).unique().tolist())
-            d2_sel = st.multiselect(f"Filter {dim2}", options=["All"] + d2_vals, default=["All"], key="hsdeal_fdim2")
-        else:
-            d2_sel = ["All"]
-
-    # ---------- Working frame ----------
-    d = df_f.copy()
-    C = coerce_datetime(d[_create]).dt.date
-    P = coerce_datetime(d[_pay]).dt.date if _pay and _pay in d.columns else pd.Series(pd.NaT, index=d.index)
-    S = pd.to_numeric(d[_score], errors="coerce")  # HubSpot Deal Score numeric
-
-    mask = pd.Series(True, index=d.index)
-    if dim1 and ("All" not in d1_sel):
-        mask &= d[dim1].fillna("Unknown").astype(str).isin(d1_sel)
-    if dim2 and ("All" not in d2_sel):
-        mask &= d[dim2].fillna("Unknown").astype(str).isin(d2_sel)
-
-    if mode == "MTD":
-        mask &= C.notna() & (C >= start_d) & (C <= end_d)
-    else:
-        if _pay and _pay in d.columns:
-            mask &= P.notna() & (P >= start_d) & (P <= end_d)
-        else:
-            st.info("No Payment column mapped; Cohort scope falls back to deals by Create Date.")
-            mask &= C.notna() & (C >= start_d) & (C <= end_d)
-
-    d_use = d.loc[mask].copy()
-    if d_use.empty:
-        st.info("No rows for the selected filters and date scope.")
+    mstart_cur, mend_cur = month_bounds(today_d)
+    c4, c5 = st.columns(2)
+    with c4:
+        cur_start = st.date_input("Prediction window start", value=mstart_cur, key="hsdls_cur_start")
+    with c5:
+        cur_end   = st.date_input("Prediction window end",   value=mend_cur,   key="hsdls_cur_end")
+    if cur_end < cur_start:
+        st.error("Prediction window end cannot be before start.")
         st.stop()
 
-    d_use["__C"] = coerce_datetime(d_use[_create]).dt.date
-    # robust age calc for Python date vs Timestamp
-    d_use["__age_days"] = pd.to_numeric([(today_d - c).days if pd.notna(c) else np.nan for c in d_use["__C"]])
-    d_use["__Score"] = pd.to_numeric(d_use[_score], errors="coerce")
-    d_use["__CreateMonth"] = coerce_datetime(d_use[_create]).dt.to_period("M").astype(str)
-
-    # ---------- Normalization ----------
-    coln1, coln2 = st.columns([1.3, 1.4])
-    with coln1:
-        norm_method = st.radio(
-            "Normalization method",
-            ["Filter matured (age ≥ A days)", "Age-adjusted to A days (proportional)"],
-            index=0,
-            horizontal=False,
-            key="hsdeal_norm_method",
-            help=(
-                "Filter matured: only include deals whose age is at least the evaluation age.\n"
-                "Age-adjusted: scale each deal’s score by (min(age, A)/A) to approximate value at A days."
-            )
-        )
-    with coln2:
-        agg_stat = st.selectbox(
-            "Aggregate statistic",
-            ["Mean", "Median"],
-            index=0,
-            key="hsdeal_stat"
-        )
-
-    if norm_method.startswith("Filter"):
-        d_work = d_use[(d_use["__age_days"] >= eval_age) & d_use["__Score"].notna()].copy()
-        d_work["__Score_norm"] = d_work["__Score"] * 1.0
-        norm_note = f"Filtered to deals with age ≥ {eval_age} days"
-    else:
-        d_work = d_use[d_use["__Score"].notna()].copy()
-        d_work["__adj_ratio"] = (d_work["__age_days"].clip(lower=0).fillna(0) / float(eval_age)).clip(upper=1.0)
-        d_work = d_work[d_work["__adj_ratio"] > 0]
-        d_work["__Score_norm"] = d_work["__Score"] / d_work["__adj_ratio"]
-        norm_note = f"Age-adjusted to {eval_age} days (proportional upscaling, capped)"
-
-    if d_work.empty:
-        st.info("No rows after normalization. Try lowering the evaluation age or changing filters.")
+    # ---------- Build Training (historical) ----------
+    cur_per = pd.Period(today_d, freq="M")
+    hist_months = [cur_per - i for i in range(1, lookback+1)]
+    if not hist_months:
+        st.info("No historical months selected.")
         st.stop()
 
-    agg_fn = np.mean if agg_stat == "Mean" else np.median
-    stat_name = agg_stat
+    # A deal is in a historical month by its Create month
+    dfm["__Cper"] = dfm["__C"].dt.to_period("M")
+    hist_mask = dfm["__Cper"].isin(hist_months) & has_score
+    # Label = converted (ever got a payment date)
+    dfm["__converted"] = dfm["__P"].notna()
 
-    grp = (d_work.groupby("__CreateMonth")
-                 .agg(
-                     DealScore_Norm=("__Score_norm", agg_fn),
-                     Deals_Included=("__Score_norm", "size"),
-                 )
-                 .reset_index())
+    hist_df = dfm.loc[hist_mask, ["__C","__P","__S","__converted"]].copy()
 
-    grp_raw = (d_work.groupby("__CreateMonth")
-                     .agg(DealScore_Raw=("__Score", agg_fn))
-                     .reset_index())
-    grp = grp.merge(grp_raw, on="__CreateMonth", how="left")
+    if hist_df.empty:
+        st.info("No historical rows with HubSpot Deal Score found in the selected lookback.")
+        st.stop()
 
+    # ---------- Normalization for "young" deals ----------
+    # adjusted_score = score * min(ref_age_days / max(age_days,1), 1.0)
+    age_days_hist = (pd.Timestamp(today_d) - hist_df["__C"]).dt.days.clip(lower=1)
+    hist_df["__S_adj"] = hist_df["__S"] * np.minimum(ref_age_days / age_days_hist, 1.0)
+
+    # ---------- Learn probability by score range ----------
+    # Quantile-based bins for even coverage; fallback to linear if ties dominate
     try:
-        grp["_seq"] = pd.PeriodIndex(grp["__CreateMonth"], freq="M")
-        grp = grp.sort_values("_seq").drop(columns="_seq")
+        q = np.linspace(0, 1, n_bins+1)
+        edges = np.unique(np.nanquantile(hist_df["__S_adj"], q))
+        if len(edges) < 3:
+            raise ValueError
     except Exception:
-        grp = grp.sort_values("__CreateMonth")
+        smin, smax = float(hist_df["__S_adj"].min()), float(hist_df["__S_adj"].max())
+        if smax <= smin:
+            smax = smin + 1e-6
+        edges = np.linspace(smin, smax, n_bins+1)
 
-    grp["Change vs prev (norm)"] = grp["DealScore_Norm"].pct_change().replace([np.inf, -np.inf], np.nan) * 100.0
+    hist_df["__bin"] = pd.cut(hist_df["__S_adj"], bins=edges, include_lowest=True, right=True)
 
-    # ---------- View ----------
-    view = st.radio("View as", ["Graph", "Table"], horizontal=True, key="hsdeal_view")
+    # Laplace smoothing to avoid 0/100%
+    grp = (hist_df.groupby("__bin", observed=True)["__converted"]
+                 .agg(Total="count", Conversions="sum"))
+    grp["Prob%"] = (grp["Conversions"] + 1) / (grp["Total"] + 2) * 100.0
+    grp = grp.reset_index()
+    grp["Range"] = grp["__bin"].astype(str)
 
-    st.caption(f"Normalization: {norm_note} • Statistic: **{stat_name}**")
-
-    if view == "Graph":
-        base = alt.Chart(grp).properties(height=360)
-        line_norm = base.mark_line(point=True).encode(
-            x=alt.X("__CreateMonth:N", title="Create Month"),
-            y=alt.Y("DealScore_Norm:Q", title=f"Normalized Deal Score ({stat_name})"),
-            tooltip=[
-                alt.Tooltip("__CreateMonth:N", title="Create Month"),
-                alt.Tooltip("DealScore_Norm:Q", title=f"Norm {stat_name}", format=".2f"),
-                alt.Tooltip("DealScore_Raw:Q",  title=f"Raw {stat_name}",  format=".2f"),
-                alt.Tooltip("Deals_Included:Q", title="Deals (included)"),
-                alt.Tooltip("Change vs prev (norm):Q", title="MoM %", format=".1f")
-            ]
-        ).properties(title="Normalized HubSpot Deal Score by Create Month")
-
-        bar_cnt = base.mark_bar(opacity=0.25).encode(
-            x=alt.X("__CreateMonth:N"),
-            y=alt.Y("Deals_Included:Q", title="Deals Included"),
-            tooltip=[alt.Tooltip("Deals_Included:Q", title="Deals included")]
-        )
-
-        st.altair_chart(alt.layer(bar_cnt, line_norm).resolve_scale(y='independent'), use_container_width=True)
-    else:
-        show = grp.rename(columns={
-            "__CreateMonth":"Create Month",
-            "DealScore_Norm":   f"Normalized Deal Score ({stat_name})",
-            "DealScore_Raw":    f"Raw Deal Score ({stat_name})",
-            "Deals_Included":"Deals Included",
-            "Change vs prev (norm)":"MoM % (Normalized)"
-        }).copy()
-        show["MoM % (Normalized)"] = show["MoM % (Normalized)"].round(1)
-        st.dataframe(show, use_container_width=True)
-        st.download_button(
-            "Download CSV — HubSpot Deal Score tracker",
-            show.to_csv(index=False).encode("utf-8"),
-            "hubspot_deal_score_tracker.csv",
-            "text/csv",
-            key="hsdeal_dl"
-        )
-
-    # ---------- Extra distribution view ----------
-    with st.expander("Distribution — Raw vs Normalized (by Create Month)"):
-        long_raw = d_work.copy()
-        long_raw["Metric"] = "Raw"
-        long_raw["Value"]  = long_raw["__Score"].astype(float)
-        long_norm = d_work.copy()
-        long_norm["Metric"] = "Normalized"
-        long_norm["Value"]  = long_norm["__Score_norm"].astype(float)
-
-        long_all = pd.concat(
-            [long_raw[["__CreateMonth","Metric","Value"]],
-             long_norm[["__CreateMonth","Metric","Value"]]],
-            ignore_index=True
-        ).dropna(subset=["Value"])
-
-        if not long_all.empty:
-            ch = (
-                alt.Chart(long_all)
-                .mark_boxplot()
-                .encode(
-                    x=alt.X("__CreateMonth:N", title="Create Month"),
-                    y=alt.Y("Value:Q", title="HubSpot Deal Score"),
-                    color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
-                    tooltip=[alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".2f")]
-                )
-                .properties(height=320, title="Raw vs Normalized HubSpot Deal Score")
+    # ---------- Show Calibration (bins) ----------
+    st.markdown("### Calibration: HubSpot Deal Score → Conversion Probability (historical)")
+    left, right = st.columns([2, 1])
+    with left:
+        if not grp.empty:
+            base = alt.Chart(grp).encode(x=alt.X("Range:N", sort=list(grp["Range"])))
+            bars = base.mark_bar(opacity=0.9).encode(
+                y=alt.Y("Total:Q", title="Count"),
+                tooltip=["Range:N","Total:Q","Conversions:Q","Prob%:Q"]
             )
-            st.altair_chart(ch, use_container_width=True)
+            line = base.mark_line(point=True).encode(
+                y=alt.Y("Prob%:Q", title="Conversion Rate (%)", axis=alt.Axis(titleColor="#1f77b4")),
+                color=alt.value("#1f77b4")
+            )
+            st.altair_chart(
+                alt.layer(bars, line).resolve_scale(y='independent').properties(
+                    height=360, title=f"Learned bins (lookback={lookback} mo, ref age={ref_age_days}d)"
+                ),
+                use_container_width=True
+            )
         else:
-            st.caption("Not enough data to show distributions.")
+            st.info("Not enough data to learn a calibration curve.")
+    with right:
+        st.dataframe(grp[["Range","Total","Conversions","Prob%"]].sort_values("Range"), use_container_width=True)
+        st.download_button(
+            "Download bins CSV",
+            grp[["Range","Total","Conversions","Prob%"]].to_csv(index=False).encode("utf-8"),
+            "hubspot_deal_score_bins.csv","text/csv", key="dl_hs_bins"
+        )
+
+    st.markdown("---")
+
+    # ---------- Predict current-month likelihoods ----------
+    st.markdown("### Running-month: normalized score → probability & expected conversions")
+
+    cur_mask = dfm["__C"].dt.date.between(cur_start, cur_end) & has_score
+    cur_df = dfm.loc[cur_mask, ["__C","__S"]].copy()
+    if cur_df.empty:
+        st.info("No deals created in the selected prediction window with a HubSpot Deal Score.")
+        st.stop()
+
+    cur_age = (pd.Timestamp(today_d) - cur_df["__C"]).dt.days.clip(lower=1)
+    cur_df["__S_adj"] = cur_df["__S"] * np.minimum(ref_age_days / cur_age, 1.0)
+    cur_df["__bin"] = pd.cut(cur_df["__S_adj"], bins=edges, include_lowest=True, right=True)
+
+    cur_df = cur_df.merge(grp[["__bin","Prob%"]], on="__bin", how="left")
+    cur_df["Prob%"] = cur_df["Prob%"].fillna(method="ffill").fillna(method="bfill")
+    cur_df["Prob%"] = cur_df["Prob%"].fillna(float(grp["Prob%"].mean() if not grp["Prob%"].empty else 0.0))
+    cur_df["Prob"] = cur_df["Prob%"] / 100.0
+
+    expected_conversions = float(cur_df["Prob"].sum())
+    total_deals = int(len(cur_df))
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Deals in window", f"{total_deals:,}", help=f"{cur_start} → {cur_end}")
+    k2.metric("Expected conversions (E[∑p])", f"{expected_conversions:.1f}")
+    k3.metric("Avg probability", f"{(cur_df['Prob'].mean()*100.0):.1f}%")
+
+    present = (cur_df.groupby("__bin").size().rename("Count").reset_index()
+                      .merge(grp[["__bin","Prob%"]], on="__bin", how="left"))
+    present["Range"] = present["__bin"].astype(str)
+    st.altair_chart(
+        alt.Chart(present).mark_bar(opacity=0.9).encode(
+            x=alt.X("Range:N", sort=list(grp["Range"]), title="Score range (normalized)"),
+            y=alt.Y("Count:Q"),
+            tooltip=["Range:N","Count:Q","Prob%:Q"]
+        ).properties(height=320, title="Current window — deal count by normalized score bin"),
+        use_container_width=True
+    )
+
+    with st.expander("Download current-window probabilities"):
+        out = cur_df[["__C","__S","__S_adj","Prob%"]].rename(columns={
+            "__C":"Create Date", "__S":"HubSpot Deal Score", "__S_adj":f"Score (normalized to {ref_age_days}d)", "Prob%":"Estimated Conversion %"
+        })
+        st.dataframe(out.head(1000), use_container_width=True)
+        st.download_button("Download CSV", out.to_csv(index=False).encode("utf-8"),
+                           "hubspot_deal_score_current_window_probs.csv","text/csv", key="dl_hs_cur")
+
+    st.caption(
+        "Notes: Normalization multiplies young-deal scores by min(ref_age / age, 1). "
+        "Calibration uses historical lookback (excluding current month) with Laplace smoothing."
+    )
+
 
