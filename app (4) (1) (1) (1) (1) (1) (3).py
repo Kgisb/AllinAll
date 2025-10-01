@@ -167,7 +167,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio(
         "Go to",
-        ["Cash-in", "Dashboard", "MIS", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap"],  # ← add this
+        ["Cash-in", "Dashboard", "MIS", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HSDLS code tracker"],  # ← add this
         index=0
     )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
@@ -6967,3 +6967,291 @@ elif view == "Cash-in":
                         st.caption("No obvious numeric column found for a quick bar viz.")
         except Exception as e:
             st.error(f"Error parsing A2:D13: {e}")
+# =========================
+# HSDLS code tracker (normalized month-on-month)
+# =========================
+elif view == "HSDLS code tracker":
+    import pandas as pd
+    import numpy as np
+    import altair as alt
+    from datetime import date, timedelta
+    from calendar import monthrange
+
+    st.subheader("HSDLS code tracker — Normalized Cohort Trend (MTD / Cohort)")
+
+    # ---------- Helpers (use your existing coerce_datetime if available) ----------
+    def _find_col(df, choices):
+        for c in choices:
+            if c in df.columns:
+                return c
+        return None
+
+    # Try your mapped columns first; then fall back to common aliases
+    _create = create_col if (create_col in df_f.columns) else _find_col(df_f, [
+        "Create Date","Created Date","Deal Create Date","CreateDate","Created On"
+    ])
+    _pay    = pay_col    if (pay_col    in df_f.columns) else _find_col(df_f, [
+        "Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"
+    ])
+    _hsdls  = _find_col(df_f, ["HSDLS Code","HSDLS","HSDLS Score","HSDLScode","HSDLS_Code"])
+
+    if not _create or _create not in df_f.columns:
+        st.warning("HSDLS tracker needs a valid **Create Date** column.", icon="⚠️")
+        st.stop()
+    if not _hsdls or _hsdls not in df_f.columns:
+        st.warning("HSDLS tracker needs an **HSDLS Code** column (e.g., 'HSDLS Code', 'HSDLS').", icon="⚠️")
+        st.stop()
+
+    # ---------- Controls ----------
+    col1, col2, col3 = st.columns([1.05, 1.2, 1.2])
+    with col1:
+        mode = st.radio(
+            "Mode",
+            ["MTD", "Cohort"],
+            index=1,
+            horizontal=True,
+            help=(
+                "MTD: restrict cohorts to deals created in the selected window; "
+                "Cohort: analyze by payment month window (but normalization is still based on Create Month)."
+            ),
+            key="hsdls_mode"
+        )
+    with col2:
+        scope = st.radio(
+            "Date scope",
+            ["This month", "Last month", "Custom"],
+            index=0,
+            horizontal=True,
+            key="hsdls_dscope"
+        )
+    with col3:
+        eval_age = st.selectbox(
+            "Normalization age (days)",
+            [7, 14, 30, 45, 60, 90],
+            index=2,
+            help="Compare cohorts at a consistent lead age to remove recency bias.",
+            key="hsdls_eval_age"
+        )
+
+    today_d = date.today()
+    if scope == "This month":
+        start_d, end_d = date(today_d.year, today_d.month, 1), date(today_d.year, today_d.month, monthrange(today_d.year, today_d.month)[1])
+    elif scope == "Last month":
+        prev_m = (today_d.replace(day=1) - timedelta(days=1))
+        start_d, end_d = date(prev_m.year, prev_m.month, 1), date(prev_m.year, prev_m.month, monthrange(prev_m.year, prev_m.month)[1])
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            start_d = st.date_input("Start date", value=today_d.replace(day=1), key="hsdls_start")
+        with c2:
+            end_d   = st.date_input("End date", value=today_d, key="hsdls_end")
+        if end_d < start_d:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+    st.caption(f"Scope: **{scope}** ({start_d} → {end_d}) • Mode: **{mode}** • Normalization age **{eval_age} days**")
+
+    # Optional dimensions for slicing (All option included)
+    dim1 = _find_col(df_f, [country_col] if country_col in df_f.columns else []) or _find_col(df_f, ["Country","Student Country","Deal Country"])
+    dim2 = _find_col(df_f, [source_col]  if source_col  in df_f.columns else []) or _find_col(df_f, ["JetLearn Deal Source","Deal Source","Source"])
+
+    f1, f2 = st.columns([1.2, 1.2])
+    with f1:
+        if dim1:
+            d1_vals = sorted(df_f[dim1].fillna("Unknown").astype(str).unique().tolist())
+            d1_sel = st.multiselect(f"Filter {dim1}", options=["All"] + d1_vals, default=["All"], key="hsdls_fdim1")
+        else:
+            d1_sel = ["All"]
+    with f2:
+        if dim2:
+            d2_vals = sorted(df_f[dim2].fillna("Unknown").astype(str).unique().tolist())
+            d2_sel = st.multiselect(f"Filter {dim2}", options=["All"] + d2_vals, default=["All"], key="hsdls_fdim2")
+        else:
+            d2_sel = ["All"]
+
+    # ---------- Build working frame ----------
+    d = df_f.copy()
+    C = coerce_datetime(d[_create]).dt.date
+    P = coerce_datetime(d[_pay]).dt.date if _pay and _pay in d.columns else pd.Series(pd.NaT, index=d.index)
+    H = pd.to_numeric(d[_hsdls], errors="coerce")  # HSDLS numeric
+
+    # Apply dimension filters
+    mask = pd.Series(True, index=d.index)
+    if dim1 and ("All" not in d1_sel):
+        mask &= d[dim1].fillna("Unknown").astype(str).isin(d1_sel)
+    if dim2 and ("All" not in d2_sel):
+        mask &= d[dim2].fillna("Unknown").astype(str).isin(d2_sel)
+
+    # Windowing by mode
+    if mode == "MTD":
+        # Cohorts are defined by Create Date within range
+        mask &= C.notna() & (C >= start_d) & (C <= end_d)
+    else:
+        # Cohort mode: still analyze by Create Month, but restrict to deals with Payment in window
+        if _pay and _pay in d.columns:
+            mask &= P.notna() & (P >= start_d) & (P <= end_d)
+        else:
+            st.info("No Payment column mapped; Cohort scope falls back to all rows in the date window of Create Date.")
+            mask &= C.notna() & (C >= start_d) & (C <= end_d)
+
+    d_use = d.loc[mask].copy()
+    if d_use.empty:
+        st.info("No rows for the selected filters and date scope.")
+        st.stop()
+
+    # Age of each deal (days since Create)
+    d_use["__C"] = coerce_datetime(d_use[_create]).dt.date
+    d_use["__age_days"] = (today_d - d_use["__C"]).dt.days if isinstance(today_d, pd.Timestamp) else pd.Series([(today_d - c).days if pd.notna(c) else np.nan for c in d_use["__C"]], index=d_use.index)
+    d_use["__H"] = pd.to_numeric(d_use[_hsdls], errors="coerce")
+
+    # Cohort month by Create
+    d_use["__CreateMonth"] = coerce_datetime(d_use[_create]).dt.to_period("M").astype(str)
+
+    # ---------- Normalization options ----------
+    coln1, coln2 = st.columns([1.3, 1.4])
+    with coln1:
+        norm_method = st.radio(
+            "Normalization method",
+            ["Filter matured (age ≥ A days)", "Age-adjusted to A days (proportional)"],
+            index=0,
+            horizontal=False,
+            key="hsdls_norm_method",
+            help=(
+                "Filter matured: only include deals whose age is at least the evaluation age.\n"
+                "Age-adjusted: scale each deal’s HSDLS by (min(age, A)/A) to approximate value at A days."
+            )
+        )
+    with coln2:
+        agg_stat = st.selectbox(
+            "Aggregate statistic",
+            ["Mean", "Median"],
+            index=0,
+            key="hsdls_stat"
+        )
+
+    # Build normalized value per row
+    if norm_method.startswith("Filter"):
+        # Keep only matured deals
+        d_work = d_use[(d_use["__age_days"] >= eval_age) & d_use["__H"].notna()].copy()
+        d_work["__H_norm"] = d_work["__H"] * 1.0
+        norm_note = f"Filtered to deals with age ≥ {eval_age} days"
+    else:
+        # Proportional scaling to A days (cap at A)
+        # If age is 0 or NaN, drop (no information)
+        d_work = d_use[d_use["__H"].notna()].copy()
+        d_work["__adj_ratio"] = d_work["__age_days"].clip(lower=0).fillna(0) / float(eval_age)
+        d_work["__adj_ratio"] = d_work["__adj_ratio"].clip(upper=1.0)
+        d_work = d_work[d_work["__adj_ratio"] > 0]  # need some age
+        d_work["__H_norm"] = d_work["__H"] / d_work["__adj_ratio"]
+        norm_note = f"Age-adjusted to {eval_age} days (proportional upscaling, capped)"
+
+    # Aggregate by CreateMonth
+    if d_work.empty:
+        st.info("No rows after normalization. Try lowering the evaluation age or changing filters.")
+        st.stop()
+
+    if agg_stat == "Mean":
+        agg_fn = np.mean
+        stat_name = "Mean"
+    else:
+        agg_fn = np.median
+        stat_name = "Median"
+
+    grp = (d_work.groupby("__CreateMonth")
+                 .agg(
+                     HSDLS_Norm=( "__H_norm", agg_fn),
+                     Deals_Included=("__H_norm", "size"),
+                 )
+                 .reset_index()
+          )
+
+    # For context, also compute raw (non-normalized) mean/median on same included rows
+    grp_raw = (d_work.groupby("__CreateMonth")
+                     .agg(HSDLS_Raw=("__H", agg_fn))
+                     .reset_index())
+    grp = grp.merge(grp_raw, on="__CreateMonth", how="left")
+
+    # Sort by month
+    try:
+        grp["_seq"] = pd.PeriodIndex(grp["__CreateMonth"], freq="M")
+        grp = grp.sort_values("_seq").drop(columns="_seq")
+    except Exception:
+        grp = grp.sort_values("__CreateMonth")
+
+    # ---------- % change vs previous month ----------
+    grp["Change vs prev (norm)"] = grp["HSDLS_Norm"].pct_change().replace([np.inf, -np.inf], np.nan) * 100.0
+
+    # ---------- View toggle ----------
+    view = st.radio("View as", ["Graph", "Table"], horizontal=True, key="hsdls_view")
+
+    st.caption(f"Normalization: {norm_note} • Statistic: **{stat_name}**")
+
+    if view == "Graph":
+        base = alt.Chart(grp).properties(height=360)
+        line_norm = base.mark_line(point=True).encode(
+            x=alt.X("__CreateMonth:N", title="Create Month"),
+            y=alt.Y("HSDLS_Norm:Q", title=f"Normalized HSDLS ({stat_name})"),
+            tooltip=[
+                alt.Tooltip("__CreateMonth:N", title="Create Month"),
+                alt.Tooltip("HSDLS_Norm:Q", title=f"Norm {stat_name}", format=".2f"),
+                alt.Tooltip("HSDLS_Raw:Q", title=f"Raw {stat_name}", format=".2f"),
+                alt.Tooltip("Deals_Included:Q", title="Deals (included)"),
+                alt.Tooltip("Change vs prev (norm):Q", title="MoM %", format=".1f")
+            ]
+        ).properties(title="Normalized HSDLS by Create Month")
+
+        # Optional secondary bar for included deals
+        bar_cnt = base.mark_bar(opacity=0.25).encode(
+            x=alt.X("__CreateMonth:N"),
+            y=alt.Y("Deals_Included:Q", title="Deals Included"),
+            tooltip=[alt.Tooltip("Deals_Included:Q", title="Deals included")]
+        )
+
+        st.altair_chart(alt.layer(bar_cnt, line_norm).resolve_scale(y='independent'), use_container_width=True)
+    else:
+        show = grp.rename(columns={
+            "__CreateMonth":"Create Month",
+            "HSDLS_Norm":   f"Normalized HSDLS ({stat_name})",
+            "HSDLS_Raw":    f"Raw HSDLS ({stat_name})",
+            "Deals_Included":"Deals Included",
+            "Change vs prev (norm)":"MoM % (Normalized)"
+        }).copy()
+        show["MoM % (Normalized)"] = show["MoM % (Normalized)"].round(1)
+        st.dataframe(show, use_container_width=True)
+        st.download_button(
+            "Download CSV — HSDLS tracker",
+            show.to_csv(index=False).encode("utf-8"),
+            "hsdls_tracker.csv",
+            "text/csv",
+            key="hsdls_dl"
+        )
+
+    # ---------- Side-by-side dynamics (optional quick looks) ----------
+    with st.expander("Extra: Month-on-Month distributions (raw vs normalized)"):
+        # Build long-form for an easy multi-view chart
+        long_raw = d_work.copy()
+        long_raw["Metric"] = "Raw"
+        long_raw["Value"]  = long_raw["__H"].astype(float)
+        long_norm = d_work.copy()
+        long_norm["Metric"] = "Normalized"
+        long_norm["Value"]  = long_norm["__H_norm"].astype(float)
+
+        long_all = pd.concat([long_raw[["__CreateMonth","Metric","Value"]],
+                              long_norm[["__CreateMonth","Metric","Value"]]], ignore_index=True)
+        long_all = long_all.dropna(subset=["Value"])
+
+        if not long_all.empty:
+            ch = (
+                alt.Chart(long_all)
+                .mark_boxplot()
+                .encode(
+                    x=alt.X("__CreateMonth:N", title="Create Month"),
+                    y=alt.Y("Value:Q", title="HSDLS"),
+                    color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=[alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".2f")]
+                )
+                .properties(height=320, title="Distribution — Raw vs Normalized")
+            )
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.caption("Not enough data to show distributions.")
