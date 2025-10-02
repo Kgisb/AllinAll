@@ -8868,339 +8868,315 @@ elif view == "Daily Business":
         key="db_dl"
     )
 
+# =========================
+# Business Projection (add 2 ML models + Accuracy %)
+# =========================
 elif view == "Business Projection":
-    import pandas as pd, numpy as np, altair as alt
-    from datetime import date
-    from calendar import monthrange
+    def _business_projection_tab():
+        import pandas as pd, numpy as np
+        from datetime import date
+        from calendar import monthrange
+        import altair as alt
 
-    st.subheader("Business Projection — ML Forecast of Monthly Enrolments")
+        # sklearn models (all standard libs)
+        from sklearn.linear_model import Ridge, Lasso
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.metrics import mean_absolute_percentage_error
 
-    # ---------- Resolve columns (Payment / Country / Source) ----------
-    def _pick(df, preferred, cands):
-        if preferred and preferred in df.columns: return preferred
-        for c in cands:
-            if c in df.columns: return c
-        return None
+        st.subheader("Business Projection — Monthly Enrolment Forecast (with model selection & Accuracy %)")
 
-    _pay = _pick(df_f, globals().get("pay_col"),
-                 ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
-    _cty = _pick(df_f, globals().get("country_col"),
-                 ["Country","Student Country","Deal Country"])
-    _src = _pick(df_f, globals().get("source_col"),
-                 ["JetLearn Deal Source","Deal Source","Source","Lead Source"])
-
-    if not _pay:
-        st.warning("Business Projection needs a payment/enrolment date column (e.g., ‘Payment Received Date’).", icon="⚠️")
-        st.stop()
-
-    # ---------- Controls ----------
-    c0, c1, c2 = st.columns([1.1, 1.1, 1.2])
-    with c0:
-        # Pick the month you want to forecast (first of month)
-        today_d = date.today()
-        default_target = today_d.replace(day=1)
-        target_month = st.date_input("Target month (first of month)", value=default_target,
-                                     help="We will train using data up to the month before this, excluding this month from training.")
-        if isinstance(target_month, tuple): target_month = target_month[0]
-        target_per = pd.Period(target_month.replace(day=1), freq="M")
-    with c1:
-        backtest_k = st.selectbox("Backtest horizon (months)", [3, 6, 9, 12], index=1,
-                                  help="Rolling-origin backtest window for accuracy metrics.")
-    with c2:
-        model_pref = st.selectbox("Model", ["Auto (Ridge + Lags)", "Seasonal Avg (fallback)"], index=0)
-
-    # ---------- Prepare monthly series ----------
-    df = df_f.copy()
-    df["_P"] = coerce_datetime(df[_pay])  # use your helper; dayfirst set in helper
-    df["_P_M"] = df["_P"].dt.to_period("M")
-    # Drop NaTs
-    df = df[df["_P_M"].notna()].copy()
-
-    # Monthly total series
-    monthly = (df["_P_M"].value_counts()
-                 .sort_index()
-                 .rename_axis("Month")
-                 .rename("Enrolments")
-                 .reset_index())
-    monthly["Month"] = monthly["Month"].astype("period[M]")
-
-    if monthly.empty:
-        st.info("No payment/enrolment rows found.", icon="ℹ️")
-        st.stop()
-
-    # Ensure continuity (fill missing months with 0)
-    full_idx = pd.period_range(start=monthly["Month"].min(), end=monthly["Month"].max(), freq="M")
-    y_all = pd.Series(0, index=full_idx)
-    y_all.update(monthly.set_index("Month")["Enrolments"])
-    y_all = y_all.sort_index()
-
-    # ---------- Feature builder for Ridge (lags + month-of-year dummies) ----------
-    def _build_xy(y: pd.Series, max_lag: int = 12):
-        dfX = pd.DataFrame({"y": y.astype(float)})
-        for L in range(1, max_lag+1):
-            dfX[f"lag{L}"] = dfX["y"].shift(L)
-        # month-of-year one-hot
-        dfX["m"] = [p.month for p in dfX.index]
-        dummies = pd.get_dummies(dfX["m"].astype(int), prefix="m", drop_first=True)
-        dfX = pd.concat([dfX.drop(columns=["m"]), dummies], axis=1)
-        dfX = dfX.dropna().copy()
-        X = dfX.drop(columns=["y"])
-        yv = dfX["y"]
-        return X, yv
-
-    # ---------- Model fit/predict helpers ----------
-    def _fit_ridge(X, y):
-        try:
-            from sklearn.linear_model import Ridge
-            mdl = Ridge(alpha=1.0, fit_intercept=True, random_state=42)
-            mdl.fit(X, y)
-            return mdl
-        except Exception:
+        # ---------- Resolve columns ----------
+        def _pick(df, preferred, cands):
+            if preferred and preferred in df.columns: return preferred
+            for c in cands:
+                if c in df.columns: return c
             return None
 
-    def _predict_next_ridge(y: pd.Series):
-        # Build features using all y available
-        X, yv = _build_xy(y)
-        if X.empty or len(yv) < 6:  # not enough history
-            return None, None
-        mdl = _fit_ridge(X, yv)
-        if mdl is None:
-            return None, None
-        # Build one-row feature for next month
-        last = y.index.max()
-        next_per = last + 1
-        # Assemble a tiny frame with lags taken from y (needs 12 history ideally)
-        need = {}
-        for L in range(1, 13):
-            need[f"lag{L}"] = float(y.iloc[-L]) if len(y) >= L else np.nan
-        if np.isnan(np.array(list(need.values()))).any():
-            return None, None
-        m = next_per.month
-        dummy_cols = [c for c in X.columns if c.startswith("m_")]
-        row = {**need}
-        # Month dummies: base is one month; we set the matching dummy=1
-        row.update({dc: 0.0 for dc in dummy_cols})
-        col_for_month = f"m_{m}"  # if this is the dropped base, all zeros is fine
-        if col_for_month in row:
-            row[col_for_month] = 1.0
-        x_row = pd.DataFrame([row])[X.columns]
-        pred = float(mdl.predict(x_row)[0])
-        return pred, mdl
+        _pay = _pick(df_f, globals().get("pay_col"),
+                     ["Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"])
+        _cty = _pick(df_f, globals().get("country_col"),
+                     ["Country","Student Country","Deal Country"])
+        _src = _pick(df_f, globals().get("source_col"),
+                     ["JetLearn Deal Source","Deal Source","Source","Lead Source","_src_raw"])
 
-    def _seasonal_avg_forecast(y: pd.Series, window_years: int = 3):
-        """
-        Average of same month across last N years (or all), fallback to overall mean if sparse.
-        """
-        tgt_month = (y.index.max() + 1).month
-        hist = y.copy()
-        if window_years > 0:
-            cutoff = pd.Period((y.index.max() - (12 * window_years) + 1), freq="M")
-            hist = hist[hist.index >= cutoff]
-        same = hist[[p.month == tgt_month for p in hist.index]]
-        if len(same) >= 1:
-            return float(same.mean())
-        return float(hist.mean()) if len(hist) else 0.0
+        if not _pay:
+            st.warning("This tile needs a ‘Payment Received Date’ column to count enrolments. Please map it.", icon="⚠️")
+            st.stop()
 
-    # ---------- Backtest (rolling origin, one-step) ----------
-    def _backtest(y: pd.Series, k: int, use_ridge: bool = True):
-        # Use last k months as test, predicting each from history up to t-1.
-        if len(y) <= (12 + max(3, k)):
-            # not enough data for proper lags; degrade k
-            k = max(1, min(k, max(0, len(y) - 13)))
-        if k <= 0:
-            return pd.DataFrame(columns=["Month","Actual","Pred"])
-        hist_end = len(y) - k
-        results = []
-        for i in range(hist_end, len(y)):
-            train = y.iloc[:i]  # up to t-1
-            actual = float(y.iloc[i])
-            if use_ridge:
-                pred, mdl = _predict_next_ridge(train)
-                if pred is None:
-                    pred = _seasonal_avg_forecast(train)
+        # ---------- Controls ----------
+        c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
+        with c1:
+            lookback = st.selectbox("Backtest window (months, exclude current)", [6, 9, 12, 18, 24], index=2)
+        with c2:
+            max_lag = st.selectbox("Max lag (months)", [3, 6, 9, 12], index=2)
+        with c3:
+            model_name = st.selectbox(
+                "Model",
+                [
+                    "Ridge (lags + seasonality)",
+                    "Lasso (lags + seasonality)",
+                    "Random Forest (lags + seasonality)"
+                ],
+                index=0
+            )
+
+        # Target month to predict
+        t1, t2 = st.columns([1, 2])
+        with t1:
+            target_month = st.date_input("Forecast month (use 1st of month)", value=date.today().replace(day=1), key="bp_target")
+            if isinstance(target_month, tuple): target_month = target_month[0]
+        with t2:
+            show_components = st.multiselect(
+                "Show on chart",
+                ["History", "Backtest (pred vs. actual)", "Forecast"],
+                default=["History","Forecast"]
+            )
+
+        # ---------- Build monthly target series (counts) ----------
+        dfp = df_f.copy()
+        dfp["_P"] = pd.to_datetime(dfp[_pay], errors="coerce", dayfirst=True)
+        dfp = dfp[dfp["_P"].notna()].copy()
+        dfp["_PM"] = dfp["_P"].dt.to_period("M")
+
+        y = dfp.groupby("_PM").size().rename("Enrolments").sort_index()  # PeriodIndex -> counts
+        if y.empty:
+            st.info("No payments found to build a monthly series.")
+            st.stop()
+
+        # Ensure continuous monthly index
+        full_idx = pd.period_range(start=y.index.min(), end=y.index.max(), freq="M")
+        y = y.reindex(full_idx, fill_value=0)
+
+        # ---------- Design matrix: lags + month-of-year dummies ----------
+        def build_design(y_ser: pd.Series, max_lag: int):
+            dfX = pd.DataFrame({"y": y_ser.astype(float)})
+            for L in range(1, max_lag+1):
+                dfX[f"lag_{L}"] = dfX["y"].shift(L)
+
+            # Month-of-year dummies (1..12) from PeriodIndex
+            months = pd.Series([p.month for p in dfX.index], index=dfX.index, name="month")
+            dummies = pd.get_dummies(months.astype("category"), prefix="m", drop_first=True)
+            dfX = pd.concat([dfX, dummies], axis=1)
+
+            # drop initial NaNs due to lagging
+            dfX = dfX.dropna()
+            X = dfX.drop(columns=["y"])
+            y_out = dfX["y"]
+            return X, y_out
+
+        # ---------- Backtest (rolling-origin) to compute Accuracy % ----------
+        # We test only on the last K full months before the current month (exclude current)
+        today_per = pd.Period(date.today(), freq="M")
+        hist_end = min(y.index.max(), today_per - 1)  # last complete month
+        hist_start = max(y.index.min(), hist_end - (lookback - 1))
+        y_hist = y.loc[hist_start:hist_end].copy()
+
+        def make_model(name: str):
+            if name.startswith("Ridge"):
+                return Ridge(alpha=2.0, random_state=42)
+            if name.startswith("Lasso"):
+                return Lasso(alpha=0.5, random_state=42, max_iter=10000)
+            # Random Forest
+            return RandomForestRegressor(
+                n_estimators=500, max_depth=None, min_samples_leaf=2,
+                random_state=42
+            )
+
+        model = make_model(model_name)
+
+        # Backtest strategy: expanding-window, predict one-step ahead
+        preds_bt, actual_bt, idx_bt = [], [], []
+        # Build full design once (we will slice)
+        X_full, y_full = build_design(y, max_lag=max_lag)
+        # Convert indices to Periods to align
+        idx_full = X_full.index
+
+        # Define the backtest target index (periods we will predict)
+        bt_periods = [p for p in y_hist.index if p in idx_full]  # ensure design exists
+        for t in bt_periods:
+            # train end = previous month of t
+            train_end_pos = np.where(idx_full < t)[0]
+            if len(train_end_pos) == 0:  # no training rows yet
+                continue
+            train_mask = idx_full < t
+            X_tr, y_tr = X_full.loc[train_mask], y_full.loc[train_mask]
+
+            # if too small to fit
+            if len(X_tr) < max(8, max_lag + 4):
+                continue
+
+            # fit & predict t
+            model.fit(X_tr, y_tr)
+            if t not in X_full.index:  # safety
+                continue
+            y_hat = float(model.predict(X_full.loc[[t]])[0])
+            preds_bt.append(max(0.0, y_hat))
+            actual_bt.append(float(y.loc[t]))
+            idx_bt.append(t)
+
+        if preds_bt and actual_bt:
+            # Accuracy % from MAPE (clip to [0, 100])
+            mape = mean_absolute_percentage_error(actual_bt, preds_bt)
+            acc_pct = max(0.0, min(100.0, 100.0 * (1.0 - mape)))
+        else:
+            acc_pct = np.nan
+
+        # ---------- Fit on all available history & produce forecast for chosen month ----------
+        # Ensure the target month exists in the design index (append zeros into y if needed)
+        last_hist_per = y.index.max()
+        tgt_per = pd.Period(target_month, freq="M")
+        if tgt_per > last_hist_per:
+            # extend y up to target with zeros to allow feature creation (lags will use history)
+            extend_idx = pd.period_range(start=y.index.min(), end=tgt_per, freq="M")
+            y_ext = y.reindex(extend_idx, fill_value=0.0)
+        else:
+            y_ext = y.copy()
+
+        X_all, y_all = build_design(y_ext, max_lag=max_lag)
+        # Only predict if target in X_all index
+        forecast_val = None
+        if tgt_per in X_all.index and len(X_all) >= max(8, max_lag + 4):
+            model = make_model(model_name)  # fresh instance
+            # train using all rows prior to target month
+            train_mask = X_all.index < tgt_per
+            if train_mask.sum() >= max(8, max_lag + 4):
+                model.fit(X_all.loc[train_mask], y_all.loc[train_mask])
+                forecast_val = float(model.predict(X_all.loc[[tgt_per]])[0])
+                if forecast_val < 0:
+                    forecast_val = 0.0
+
+        # ---------- Chart (history + backtest preds + forecast) ----------
+        chart_rows = []
+        if "History" in show_components:
+            for per, v in y.items():
+                chart_rows.append({"Month": str(per), "Component": "History", "Count": float(v)})
+        if "Backtest (pred vs. actual)" in show_components and preds_bt:
+            for per, yhat, yact in zip(idx_bt, preds_bt, actual_bt):
+                chart_rows.append({"Month": str(per), "Component": "Backtest Pred", "Count": float(yhat)})
+                chart_rows.append({"Month": str(per), "Component": "Backtest Actual", "Count": float(yact)})
+        if "Forecast" in show_components and forecast_val is not None:
+            chart_rows.append({"Month": str(tgt_per), "Component": "Forecast", "Count": float(forecast_val)})
+
+        if chart_rows:
+            ch_df = pd.DataFrame(chart_rows)
+            ch = (
+                alt.Chart(ch_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("Month:N", sort=sorted(ch_df["Month"].unique().tolist())),
+                    y=alt.Y("Count:Q", title="Enrolments (count)"),
+                    color=alt.Color("Component:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Component:N"), alt.Tooltip("Count:Q")]
+                )
+                .properties(height=340, title=f"Monthly Enrolments — {model_name}")
+            )
+            st.altair_chart(ch, use_container_width=True)
+
+        # ---------- KPI strip ----------
+        st.markdown(
+            """
+            <style>
+              .kpi-card { border:1px solid #e5e7eb; border-radius:14px; padding:10px 12px; background:#ffffff; }
+              .kpi-title { font-size:0.9rem; color:#6b7280; margin-bottom:6px; }
+              .kpi-value { font-size:1.4rem; font-weight:700; }
+              .kpi-sub { font-size:0.8rem; color:#6b7280; margin-top:4px; }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.markdown(
+                f"<div class='kpi-card'><div class='kpi-title'>Model</div>"
+                f"<div class='kpi-value'>{model_name}</div>"
+                f"<div class='kpi-sub'>lags={max_lag}, lookback={lookback}m</div></div>",
+                unsafe_allow_html=True
+            )
+        with k2:
+            acc_txt = "–" if np.isnan(acc_pct) else f"{acc_pct:.1f}%"
+            st.markdown(
+                f"<div class='kpi-card'><div class='kpi-title'>Backtest Accuracy</div>"
+                f"<div class='kpi-value'>{acc_txt}</div>"
+                f"<div class='kpi-sub'>1-step ahead, last {lookback}m</div></div>",
+                unsafe_allow_html=True
+            )
+        with k3:
+            f_txt = "–"
+            if forecast_val is not None:
+                f_txt = f"{forecast_val:.1f}"
+            st.markdown(
+                f"<div class='kpi-card'><div class='kpi-title'>Forecast for {str(tgt_per)}</div>"
+                f"<div class='kpi-value'>{f_txt}</div>"
+                f"<div class='kpi-sub'>Monthly enrolments</div></div>",
+                unsafe_allow_html=True
+            )
+
+        st.markdown("---")
+
+        # ---------- Per-Country & Per-Source allocation of the forecast ----------
+        st.markdown("#### Forecast Allocation (Country / Source)")
+        alloc_cols = st.columns(2)
+        with alloc_cols[0]:
+            do_cty = st.checkbox("Allocate by Country", value=bool(_cty), help="Uses last lookback months’ composition.", key="bp_alloc_cty")
+        with alloc_cols[1]:
+            do_src = st.checkbox("Allocate by JetLearn Deal Source", value=bool(_src), help="Uses last lookback months’ composition.", key="bp_alloc_src")
+
+        def _alloc_series(group_col):
+            if (group_col is None) or (group_col not in df_f.columns) or (forecast_val is None):
+                return pd.DataFrame(columns=["Group","Projected"])
+            sub = dfp.copy()
+            sub["_G"] = df_f[group_col].fillna("Unknown").astype(str).str.strip()
+            # last lookback months (full)
+            lb_end = hist_end
+            lb_start = max(y.index.min(), lb_end - (lookback - 1))
+            mask_lb = sub["_PM"].between(lb_start, lb_end)
+            if not mask_lb.any():
+                return pd.DataFrame(columns=["Group","Projected"])
+            comp = sub.loc[mask_lb].groupby("_G").size().rename("cnt").reset_index()
+            if comp["cnt"].sum() == 0:
+                return pd.DataFrame(columns=["Group","Projected"])
+            comp["w"] = comp["cnt"] / comp["cnt"].sum()
+            comp["Projected"] = comp["w"] * float(forecast_val)
+            comp = comp.rename(columns={"_G":"Group"})
+            return comp[["Group","Projected"]].sort_values("Projected", ascending=False)
+
+        if do_cty:
+            out_cty = _alloc_series(_cty)
+            if out_cty.empty:
+                st.info("Not enough data to allocate by Country.")
             else:
-                pred = _seasonal_avg_forecast(train)
-            results.append({"Month": y.index[i], "Actual": actual, "Pred": float(max(0.0, pred))})
-        return pd.DataFrame(results)
+                st.dataframe(out_cty, use_container_width=True)
+                st.download_button("Download CSV — Country Allocation",
+                                   out_cty.to_csv(index=False).encode("utf-8"),
+                                   "business_projection_country_allocation.csv", "text/csv")
+        if do_src:
+            out_src = _alloc_series(_src)
+            if out_src.empty:
+                st.info("Not enough data to allocate by Deal Source.")
+            else:
+                st.dataframe(out_src, use_container_width=True)
+                st.download_button("Download CSV — Source Allocation",
+                                   out_src.to_csv(index=False).encode("utf-8"),
+                                   "business_projection_source_allocation.csv", "text/csv")
 
-    # Decide model
-    use_ridge = (model_pref.startswith("Auto"))
+        # ---------- Raw backtest table (optional) ----------
+        with st.expander("Backtest details"):
+            if preds_bt and actual_bt:
+                bt_df = pd.DataFrame({
+                    "Month": [str(p) for p in idx_bt],
+                    "Actual": actual_bt,
+                    "Predicted": preds_bt
+                }).sort_values("Month")
+                bt_df["Abs % Error"] = np.where(bt_df["Actual"]>0,
+                                                np.abs(bt_df["Predicted"]-bt_df["Actual"])/bt_df["Actual"]*100.0,
+                                                np.nan)
+                st.dataframe(bt_df, use_container_width=True)
+                st.download_button("Download CSV — Backtest",
+                                   bt_df.to_csv(index=False).encode("utf-8"),
+                                   "business_projection_backtest.csv", "text/csv")
+            else:
+                st.info("Backtest window too short to compute accuracy. Add more months of data.")
 
-    # Train series up to month before target (exclude target)
-    y_hist = y_all[y_all.index < target_per].copy()
-    if len(y_hist) < 6:
-        use_ridge = False  # too short; switch to seasonal
+    # run it
+    _business_projection_tab()
 
-    # Backtest
-    bt = _backtest(y_hist, int(backtest_k), use_ridge=use_ridge)
-    if not bt.empty:
-        bt["APE"] = np.where(bt["Actual"] > 0, np.abs(bt["Actual"] - bt["Pred"]) / bt["Actual"], np.nan)
-        rmse = float(np.sqrt(((bt["Pred"] - bt["Actual"])**2).mean()))
-        mape = float(bt["APE"].mean(skipna=True) * 100.0)
-    else:
-        rmse, mape = np.nan, np.nan
-
-    # Forecast target month
-    if use_ridge:
-        pred_total, mdl_total = _predict_next_ridge(y_hist)
-        if pred_total is None:
-            pred_total = _seasonal_avg_forecast(y_hist)
-    else:
-        pred_total = _seasonal_avg_forecast(y_hist)
-    pred_total = float(max(0.0, pred_total))
-
-    # ---------- Display KPIs ----------
-    st.markdown(
-        """
-        <style>
-          .kpi-card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 10px 12px; background: #ffffff; }
-          .kpi-title { font-size: 0.9rem; color: #6b7280; margin-bottom: 6px; }
-          .kpi-value { font-size: 1.4rem; font-weight: 700; }
-          .kpi-sub { font-size: 0.8rem; color: #6b7280; margin-top: 4px; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Forecast for {str(target_per)}</div>"
-            f"<div class='kpi-value'>{int(round(pred_total)):,}</div>"
-            f"<div class='kpi-sub'>Projected enrolments (row counts)</div></div>",
-            unsafe_allow_html=True
-        )
-    with k2:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Backtest RMSE</div>"
-            f"<div class='kpi-value'>{('–' if np.isnan(rmse) else f'{rmse:.2f}')}</div>"
-            f"<div class='kpi-sub'>Rolling {backtest_k} mo</div></div>",
-            unsafe_allow_html=True
-        )
-    with k3:
-        st.markdown(
-            f"<div class='kpi-card'><div class='kpi-title'>Backtest MAPE</div>"
-            f"<div class='kpi-value'>{('–' if np.isnan(mape) else f'{mape:.1f}%')}</div>"
-            f"<div class='kpi-sub'>Rolling {backtest_k} mo</div></div>",
-            unsafe_allow_html=True
-        )
-
-    # ---------- Chart (history + forecast point) ----------
-    hist_df = y_all.reset_index().rename(columns={"index":"Month", 0:"Enrolments"})
-    hist_df["Month"] = hist_df["Month"].astype("period[M]").astype(str)
-
-    # Forecast point row
-    forecast_row = pd.DataFrame({"Month": [str(target_per)], "Value": [pred_total], "Kind": ["Forecast"]})
-    hist_rows = pd.DataFrame({"Month": hist_df["Month"], "Value": hist_df["Enrolments"].astype(float), "Kind": "Actual"})
-
-    ch = (
-        alt.Chart(pd.concat([hist_rows, forecast_row], ignore_index=True))
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Month:N", sort=hist_df["Month"].tolist() + [str(target_per)], title="Month"),
-            y=alt.Y("Value:Q", title="Enrolments"),
-            color=alt.Color("Kind:N", legend=alt.Legend(orient="bottom"))
-        )
-        .properties(height=340, title="Monthly Enrolments — Actual vs Forecast")
-    )
-    st.altair_chart(ch, use_container_width=True)
-
-    # ---------- Country & Source breakdown forecasts ----------
-    st.markdown("### Breakdown Forecasts (Country & JetLearn Deal Source)")
-    topn = st.number_input("Show top N rows per breakdown", min_value=3, max_value=50, value=15, step=1)
-
-    def _prep_group_series(colname: str):
-        if not colname or colname not in df.columns:
-            return None, None
-        cat = df[colname].fillna("Unknown").astype(str).str.strip()
-        gdf = pd.DataFrame({"Month": df["_P_M"], "Cat": cat})
-        grp = (gdf.groupby(["Cat","Month"]).size()
-                  .rename("Enrolments").reset_index())
-        # pivot to continuous monthly index per category
-        cats = sorted(grp["Cat"].unique().tolist())
-        out = {}
-        for c in cats:
-            s = grp[grp["Cat"]==c].set_index("Month")["Enrolments"]
-            s.index = s.index.astype("period[M]")
-            s = s.reindex(full_idx, fill_value=0).sort_index()
-            out[c] = s
-        return cats, out
-
-    # small helper to forecast a single category series with same model policy
-    def _forecast_1series(y: pd.Series):
-        hist = y[y.index < target_per]
-        if len(hist) < 6:
-            # allocate based on recent share
-            return None
-        if use_ridge:
-            pred, mdl = _predict_next_ridge(hist)
-            if pred is None:
-                pred = _seasonal_avg_forecast(hist)
-        else:
-            pred = _seasonal_avg_forecast(hist)
-        return float(max(0.0, pred))
-
-    # Country
-    ctry_rows = []
-    if _cty:
-        cats, series_map = _prep_group_series(_cty)
-        if cats:
-            for c in cats:
-                pred = _forecast_1series(series_map[c])
-                if pred is None:
-                    # fallback share = average share last 3 months
-                    last3 = series_map[c].iloc[-3:].sum()
-                    tot3  = sum(s.iloc[-3:].sum() for s in series_map.values())
-                    share = (last3 / tot3) if tot3 > 0 else 0.0
-                    pred = pred_total * share
-                ctry_rows.append({"Country": c, "Forecast": float(pred)})
-            ctry_df = pd.DataFrame(ctry_rows).sort_values("Forecast", ascending=False).head(int(topn))
-            st.dataframe(ctry_df, use_container_width=True)
-            st.download_button(
-                "Download CSV — Country Forecast",
-                ctry_df.to_csv(index=False).encode("utf-8"),
-                "business_projection_country.csv", "text/csv", key="bp_dl_ctry"
-            )
-        else:
-            st.info("No Country data available for breakdown.")
-    else:
-        st.info("Country column not mapped/found.", icon="ℹ️")
-
-    # Source
-    src_rows = []
-    if _src:
-        cats, series_map = _prep_group_series(_src)
-        if cats:
-            for c in cats:
-                pred = _forecast_1series(series_map[c])
-                if pred is None:
-                    last3 = series_map[c].iloc[-3:].sum()
-                    tot3  = sum(s.iloc[-3:].sum() for s in series_map.values())
-                    share = (last3 / tot3) if tot3 > 0 else 0.0
-                    pred = pred_total * share
-                src_rows.append({"JetLearn Deal Source": c, "Forecast": float(pred)})
-            src_df = pd.DataFrame(src_rows).sort_values("Forecast", ascending=False).head(int(topn))
-            st.dataframe(src_df, use_container_width=True)
-            st.download_button(
-                "Download CSV — Source Forecast",
-                src_df.to_csv(index=False).encode("utf-8"),
-                "business_projection_source.csv", "text/csv", key="bp_dl_src"
-            )
-        else:
-            st.info("No Deal Source data available for breakdown.")
-    else:
-        st.info("JetLearn Deal Source column not mapped/found.", icon="ℹ️")
-
-    # ---------- Backtest table (optional) ----------
-    with st.expander("Backtest details"):
-        if bt.empty:
-            st.info("Not enough history to run a backtest.")
-        else:
-            show_bt = bt.copy()
-            show_bt["Month"] = show_bt["Month"].astype(str)
-            show_bt["APE%"] = (show_bt["APE"] * 100.0).round(1)
-            st.dataframe(show_bt.drop(columns=["APE"]), use_container_width=True)
-            st.download_button(
-                "Download CSV — Backtest",
-                show_bt.drop(columns=["APE"]).to_csv(index=False).encode("utf-8"),
-                "business_projection_backtest.csv", "text/csv", key="bp_dl_bt"
-            )
