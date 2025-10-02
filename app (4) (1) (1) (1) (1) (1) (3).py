@@ -8576,10 +8576,10 @@ elif view == "Daily Business":
 
     st.caption(f"Window: **{range_start} → {range_end}** • Mode: **{mode}** • Granularity: **{gran}**")
 
-    # Group-by & mapping (FIX)
+    # Group-by & mapping (as before)
     label_to_col = {
         "None": None,
-        "Academic Counsellor": "Counsellor",          # base dataframe column
+        "Academic Counsellor": "Counsellor",
         "Country": "Country",
         "JetLearn Deal Source": "JetLearn Deal Source",
     }
@@ -8587,24 +8587,23 @@ elif view == "Daily Business":
     with gp1:
         group_by_label = st.selectbox("Group by (color/series)",
                                       list(label_to_col.keys()), index=0)
-        group_by_col = label_to_col[group_by_label]  # actual column name or None
+        group_by_col = label_to_col[group_by_label]
     with gp2:
         chart_type = st.selectbox("Chart type", ["Bar", "Line", "Area (stack)", "Bar + Line (overlay)"], index=3,
                                   help="Bar + Line overlays the 1st metric as bars and 2nd metric as a line (only when Group by is None).")
     with gp3:
         stack_opt = st.checkbox("Stack series (for Bar/Area)", value=True)
 
-    # Pick metrics
     METRIC_LABELS = [
         "Deals Created",
         "Enrolments",
         "First Cal Scheduled — Count",
         "Calibration Rescheduled — Count",
         "Calibration Done — Count",
-        "Enrolments / Created %",                 # derived
-        "Enrolments / Cal Done %",                # derived
-        "Cal Done / First Cal %",                 # derived
-        "First Cal / Created %",                  # derived
+        "Enrolments / Created %",
+        "Enrolments / Cal Done %",
+        "Cal Done / First Cal %",
+        "First Cal / Created %",
     ]
     default_metrics = ["Deals Created", "Enrolments"]
     metrics_sel = st.multiselect("Metrics to plot", options=METRIC_LABELS,
@@ -8686,41 +8685,56 @@ elif view == "Daily Business":
     base = base.loc[fmask].copy()
 
     # ---------------------------
-    # Bucketing helper
+    # Pretty bucketing (Key + Label)
     # ---------------------------
-    def _bucket(series_date):
+    def _bucket_key_label(series_date):
         s = pd.to_datetime(series_date, errors="coerce")
         if gran == "Day":
-            return s.dt.date
+            key   = s.dt.date
+            label = (s.dt.strftime("%b ") + s.dt.day.astype(str))
         elif gran == "Week":
-            return s.dt.to_period("W").astype(str)
+            per   = s.dt.to_period("W")
+            # sort by week start
+            key   = per.apply(lambda p: p.start_time.date() if pd.notna(p) else pd.NaT)
+            wkno  = s.dt.isocalendar().week.astype("Int64")
+            label = "Wk " + wkno.astype(str)
         elif gran == "Month":
-            return s.dt.to_period("M").astype(str)
+            per   = s.dt.to_period("M")
+            key   = per.dt.to_timestamp().dt.date
+            label = per.strftime("%b")
         else:
-            return s.dt.to_period("Y").astype(str)
+            per   = s.dt.to_period("Y")
+            key   = per.dt.to_timestamp().dt.date
+            label = per.strftime("%Y")
+        return key, label
 
     # ---------------------------
     # Build per-event frames
     # ---------------------------
     def _frame(date_series, mask, name):
         if mask is None or not mask.any():
-            return pd.DataFrame(columns=["Bucket","Group","Metric","Count"])
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
         df = base.loc[mask.loc[base.index]].copy()
-        if df.empty: return pd.DataFrame(columns=["Bucket","Group","Metric","Count"])
-        df["Bucket"] = _bucket(date_series.loc[df.index])
+        if df.empty:
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
+
+        bk, bl = _bucket_key_label(date_series.loc[df.index])
+        df["BucketKey"]   = bk
+        df["BucketLabel"] = bl
 
         if group_by_col:
-            # ensure the group col exists
             if group_by_col not in df.columns:
-                return pd.DataFrame(columns=["Bucket","Group","Metric","Count"])
-            g = df.groupby(["Bucket", group_by_col], dropna=False).size().rename("Count").reset_index()
+                return pd.DataFrame(columns=["BucketKey","BucketLabel","Group","Metric","Count"])
+            g = (df.groupby(["BucketKey","BucketLabel", group_by_col], dropna=False)
+                   .size().rename("Count").reset_index())
             g["Group"] = g[group_by_col].astype(str)
         else:
-            g = df.groupby(["Bucket"], dropna=False).size().rename("Count").reset_index()
+            g = (df.groupby(["BucketKey","BucketLabel"], dropna=False)
+                   .size().rename("Count").reset_index())
             g["Group"] = "All"
 
         g["Metric"] = name
-        return g[["Bucket","Group","Metric","Count"]]
+        return g[["BucketKey","BucketLabel","Group","Metric","Count"]]
 
     created_df = _frame(base["_C"], m_created_win.loc[base.index], "Deals Created")
     enrol_df   = _frame(base["_P"], m_enrol_eff.loc[base.index],  "Enrolments")
@@ -8731,24 +8745,26 @@ elif view == "Daily Business":
     # Merge to compute derived ratios per (Bucket, Group)
     def _merge_counts(dfs):
         if not dfs: 
-            return pd.DataFrame(columns=["Bucket","Group"])
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group"])
         out = None
         for dfi in dfs:
             if dfi is None or dfi.empty: 
                 continue
-            pivoted = dfi.pivot_table(index=["Bucket","Group"], columns="Metric", values="Count", aggfunc="sum").reset_index()
-            out = pivoted if out is None else out.merge(pivoted, on=["Bucket","Group"], how="outer")
+            piv = (dfi.pivot_table(index=["BucketKey","BucketLabel","Group"],
+                                   columns="Metric", values="Count", aggfunc="sum")
+                      .reset_index())
+            out = piv if out is None else out.merge(piv, on=["BucketKey","BucketLabel","Group"], how="outer")
         if out is None:
-            return pd.DataFrame(columns=["Bucket","Group"])
+            return pd.DataFrame(columns=["BucketKey","BucketLabel","Group"])
         out = out.fillna(0)
         # Ensure base columns exist
         for col in ["Deals Created","Enrolments","Calibration Done — Count","First Cal Scheduled — Count","Calibration Rescheduled — Count"]:
             if col not in out.columns: out[col] = 0
         # Derived %
-        out["Enrolments / Created %"]      = np.where(out["Deals Created"] > 0, out["Enrolments"] / out["Deals Created"] * 100.0, np.nan)
-        out["Enrolments / Cal Done %"]     = np.where(out["Calibration Done — Count"] > 0, out["Enrolments"] / out["Calibration Done — Count"] * 100.0, np.nan)
-        out["Cal Done / First Cal %"]      = np.where(out["First Cal Scheduled — Count"] > 0, out["Calibration Done — Count"] / out["First Cal Scheduled — Count"] * 100.0, np.nan)
-        out["First Cal / Created %"]       = np.where(out["Deals Created"] > 0, out["First Cal Scheduled — Count"] / out["Deals Created"] * 100.0, np.nan)
+        out["Enrolments / Created %"]  = np.where(out["Deals Created"] > 0, out["Enrolments"] / out["Deals Created"] * 100.0, np.nan)
+        out["Enrolments / Cal Done %"] = np.where(out["Calibration Done — Count"] > 0, out["Enrolments"] / out["Calibration Done — Count"] * 100.0, np.nan)
+        out["Cal Done / First Cal %"]  = np.where(out["First Cal Scheduled — Count"] > 0, out["Calibration Done — Count"] / out["First Cal Scheduled — Count"] * 100.0, np.nan)
+        out["First Cal / Created %"]   = np.where(out["Deals Created"] > 0, out["First Cal Scheduled — Count"] / out["Deals Created"] * 100.0, np.nan)
         return out
 
     wide = _merge_counts([created_df, enrol_df, first_df, resc_df, done_df])
@@ -8756,23 +8772,16 @@ elif view == "Daily Business":
         st.info("No data in the selected window/filters.")
         st.stop()
 
-    # Order buckets chronologically
-    def _bucket_sort_key(b):
-        try:
-            if gran == "Day":
-                return pd.to_datetime(b)
-            else:
-                return pd.Period(b, freq={"Week":"W","Month":"M","Year":"Y"}.get(gran, "D")).start_time
-        except Exception:
-            return b
-    wide = wide.sort_values("Bucket", key=lambda s: s.map(_bucket_sort_key))
+    # Sort by BucketKey and build an ordered list of labels for the x-axis
+    wide = wide.sort_values("BucketKey")
+    ordered_labels = wide.drop_duplicates(["BucketKey","BucketLabel"])["BucketLabel"].tolist()
 
     # Melt to long for charting
-    keep_cols = ["Bucket","Group"] + metrics_sel
+    keep_cols = ["BucketKey","BucketLabel","Group"] + metrics_sel
     for k in metrics_sel:
         if k not in wide.columns:
             wide[k] = np.nan
-    plot_df = wide[keep_cols].melt(id_vars=["Bucket","Group"], var_name="Metric", value_name="Value")
+    plot_df = wide[keep_cols].melt(id_vars=["BucketKey","BucketLabel","Group"], var_name="Metric", value_name="Value")
 
     base_enc = alt.Chart(plot_df)
 
@@ -8785,9 +8794,11 @@ elif view == "Daily Business":
             base_enc.transform_filter(alt.datum.Metric == m1)
             .mark_bar(opacity=0.85)
             .encode(
-                x=alt.X("Bucket:N", title="Period"),
+                x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
                 y=alt.Y("Value:Q", title=m1, axis=alt.Axis(format=".1f" if _is_ratio(m1) else "")),
-                tooltip=[alt.Tooltip("Bucket:N"), alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m1) else "d")],
+                tooltip=[alt.Tooltip("BucketLabel:N", title="Period"),
+                         alt.Tooltip("Metric:N"),
+                         alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m1) else "d")],
                 color=alt.value("#A8C5FD")
             )
         )
@@ -8797,10 +8808,12 @@ elif view == "Daily Business":
                 base_enc.transform_filter(alt.datum.Metric == m2)
                 .mark_line(point=True)
                 .encode(
-                    x=alt.X("Bucket:N", title="Period"),
+                    x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
                     y=alt.Y("Value:Q", title=m1, axis=alt.Axis(format=".1f" if _is_ratio(m1) else "")),
                     color=alt.value("#333333"),
-                    tooltip=[alt.Tooltip("Bucket:N"), alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m2) else "d")],
+                    tooltip=[alt.Tooltip("BucketLabel:N", title="Period"),
+                             alt.Tooltip("Metric:N"),
+                             alt.Tooltip("Value:Q", format=".1f" if _is_ratio(m2) else "d")],
                 )
             )
             ch = bars + line
@@ -8813,7 +8826,7 @@ elif view == "Daily Business":
     else:
         color_field = "Metric:N" if group_by_col is None else "Group:N"
         tooltip_common = [
-            alt.Tooltip("Bucket:N"),
+            alt.Tooltip("BucketLabel:N", title="Period"),
             alt.Tooltip("Group:N", title=("Group" if group_by_col is None else group_by_label)),
             alt.Tooltip("Metric:N"),
         ]
@@ -8825,7 +8838,7 @@ elif view == "Daily Business":
             mark = base_enc.mark_bar(opacity=0.85)
 
         ch = mark.encode(
-            x=alt.X("Bucket:N", title="Period"),
+            x=alt.X("BucketLabel:N", title="Period", sort=ordered_labels),
             y=alt.Y(
                 "Value:Q",
                 title="Value",
@@ -8844,11 +8857,14 @@ elif view == "Daily Business":
     show = wide.copy()
     for k in ["Enrolments / Created %","Enrolments / Cal Done %","Cal Done / First Cal %","First Cal / Created %"]:
         if k in show.columns: show[k] = show[k].round(1)
-    st.dataframe(show, use_container_width=True)
+    # Keep pretty label and drop key from display
+    out_cols = ["BucketLabel","Group"] + [c for c in show.columns if c not in {"BucketKey","BucketLabel","Group"}]
+    st.dataframe(show[out_cols].rename(columns={"BucketLabel":"Period"}), use_container_width=True)
     st.download_button(
         "Download CSV — Daily Business",
-        data=show.to_csv(index=False).encode("utf-8"),
+        data=show[out_cols].rename(columns={"BucketLabel":"Period"}).to_csv(index=False).encode("utf-8"),
         file_name="daily_business.csv",
         mime="text/csv",
         key="db_dl"
     )
+
