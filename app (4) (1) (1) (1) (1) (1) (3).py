@@ -6836,137 +6836,138 @@ elif view == "Buying Propensity":
 # =========================
 # Cash-in Tab (Google Sheet A2:D13, header from first row in range, last 'Team' row fixed)
 # =========================
+# =========================
+# Cash-in (GS -> A2:C12 table + separate A13:D13 total row)
+# =========================
 elif view == "Cash-in":
+    import re
     import pandas as pd
-    import numpy as np
-    import altair as alt
-    from io import StringIO
+    import streamlit as st
 
-    st.subheader("Cash-in — Live Pull from Google Sheet (A2:D13)")
+    st.subheader("Cash-in — Google Sheet snapshot")
 
-    # ---- Your Google Sheet (same sheet, just export as CSV)
-    # Original: https://docs.google.com/spreadsheets/d/1tw6gTaUEycAD5DJjw5ASSdF-WwYEt2TqcMb2lTKtKps/edit?gid=0#gid=0
-    SHEET_ID = "1tw6gTaUEycAD5DJjw5ASSdF-WwYEt2TqcMb2lTKtKps"
-    GID = "0"
-    CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
+    # --- Your Google Sheet URL (you can change it in the UI) ---
+    default_gsheet_url = "https://docs.google.com/spreadsheets/d/1tw6gTaUEycAD5DJjw5ASSdF-WwYEt2TqcMb2lTKtKps/edit?gid=0#gid=0"
+    sheet_url = st.text_input(
+        "Google Sheet URL",
+        value=default_gsheet_url,
+        help="Reads live CSV export of the given sheet (keeps the gid).",
+        key="cashin_sheet_url",
+    )
 
-    # ---- Fetch CSV
-    @st.cache_data(ttl=60)
-    def _load_sheet_csv(url: str) -> pd.DataFrame:
-        try:
-            df = pd.read_csv(url, dtype=str, keep_default_na=False, na_values=[""])
-        except Exception as e:
-            st.error(f"Unable to load Google Sheet: {e}")
-            return pd.DataFrame()
+    # --- Helper: convert a normal GSheet URL to a CSV export URL (preserves gid) ---
+    def gsheet_to_csv_url(url: str) -> str | None:
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+        gid_match = re.search(r"[?#]gid=(\d+)", url)
+        if not m:
+            return None
+        sheet_id = m.group(1)
+        gid = gid_match.group(1) if gid_match else "0"
+        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+    csv_url = gsheet_to_csv_url(sheet_url)
+    if not csv_url:
+        st.error("Invalid Google Sheet URL. Please paste a standard Sheets link (that contains `/spreadsheets/d/<id>`).")
+        st.stop()
+
+    @st.cache_data(ttl=90, show_spinner=False)
+    def load_gsheet_csv(url: str) -> pd.DataFrame:
+        df = pd.read_csv(url, header=0)  # A1 header row
+        # Keep only the first 4 columns (A..D) if sheet has extras
+        if df.shape[1] > 4:
+            df = df.iloc[:, :4]
+        # Drop fully empty rows
+        df = df.dropna(how="all")
+        # Strip header names
+        df.columns = [str(c).strip() for c in df.columns]
         return df
 
-    df_raw = _load_sheet_csv(CSV_URL)
+    try:
+        df_raw = load_gsheet_csv(csv_url)
+    except Exception as e:
+        st.error(f"Could not load the Google Sheet CSV. Details: {e}")
+        st.stop()
 
     if df_raw.empty:
-        st.info("No data loaded from the Google Sheet yet.")
+        st.info("The sheet appears to be empty.")
+        st.stop()
+
+    # We expect:
+    #  - A1..D1  = headers
+    #  - A2..C12 = main table (11 rows max after header)
+    #  - A13..D13 = TOTAL row (separate, not part of the table)
+    #
+    # Robust: Prefer a row whose first non-empty cell equals 'Team' (case-insensitive) as TOTAL.
+    # If not found, use the last non-empty row as TOTAL.
+    df_no_header = df_raw.iloc[1:].copy()          # rows starting at A2
+    df_no_header = df_no_header.reset_index(drop=True)
+
+    # Identify a 'Team' total row if present
+    total_row_idx = None
+    if not df_no_header.empty:
+        first_col_name = df_raw.columns[0]
+        first_col = df_no_header[first_col_name].astype(str).str.strip().str.lower()
+        team_hits = first_col[first_col.eq("team")]
+        if not team_hits.empty:
+            total_row_idx = team_hits.index[-1]     # use the last 'Team' as total
+
+    # Fallback to the very last row (as total)
+    if total_row_idx is None and not df_no_header.empty:
+        total_row_idx = df_no_header.index[-1]
+
+    # Main table: A2..C12 (i.e., up to 11 rows max) — but ensure we do NOT include total_row_idx
+    # Build candidate table rows up to row 11 (0-based slice :11)
+    table_slice = df_no_header.iloc[:11].copy() if len(df_no_header) > 0 else df_no_header.copy()
+
+    # If the chosen total row is inside that slice, drop it from the table
+    if total_row_idx is not None and total_row_idx < len(table_slice):
+        table_slice = table_slice.drop(index=total_row_idx).copy()
+
+    # Use only A..C for the table (first 3 columns)
+    if table_slice.shape[1] >= 3:
+        table_df = table_slice.iloc[:, :3].copy()
     else:
-        # ---- Slice A2:D13 -> rows: index 1..12 (inclusive), cols 0..3 (inclusive)
-        # Notes:
-        # - A2 is the first cell of the range (so row index 1 in pandas).
-        # - The FIRST row *inside this range* is treated as HEADER for the table.
-        # - The LAST row (typically containing 'Team' total) must remain as a static footer.
-        try:
-            # Safe slice (guard for sheets shorter than expected)
-            max_row = min(len(df_raw.index), 13)   # up to row 13
-            df_rng = df_raw.iloc[1:max_row, 0:4].copy()  # rows A2..A13, cols A..D
-            # Drop fully empty rows/cols
-            df_rng.replace(r"^\s*$", np.nan, regex=True, inplace=True)
-            df_rng.dropna(how="all", inplace=True)
-            df_rng.dropna(axis=1, how="all", inplace=True)
-            df_rng = df_rng.reset_index(drop=True)
+        # Pad if sheet has fewer than 3 cols (rare)
+        table_df = table_slice.copy()
 
-            if df_rng.empty:
-                st.info("Selected range A2:D13 is empty.")
-            else:
-                # First row in range is header
-                new_cols = df_rng.iloc[0].astype(str).tolist()
-                df_body = df_rng.iloc[1:].copy()
-                df_body.columns = new_cols
+    # Separate total row (A13..D13): take identified total_row_idx from df_no_header, use A..D (first 4 columns)
+    total_df = None
+    if total_row_idx is not None and total_row_idx < len(df_no_header):
+        total_row_series = df_no_header.iloc[total_row_idx, :4] if df_no_header.shape[1] >= 4 else df_no_header.iloc[total_row_idx, :]
+        total_df = pd.DataFrame([total_row_series.values], columns=df_raw.columns[:len(total_row_series)])
 
-                # If the last row is the total (e.g., column 0 contains 'Team'), keep it fixed at bottom.
-                # We'll not expose any sort controls, so it visually remains last.
-                # Still, we bold-style it so users can spot it.
-                # Identify last row as footer (assume last row is total)
-                if len(df_body) >= 1:
-                    footer_row = df_body.tail(1)
-                    body_wo_footer = df_body.iloc[:-1].copy()
-                else:
-                    footer_row = pd.DataFrame(columns=df_body.columns)
-                    body_wo_footer = df_body.copy()
+    # ---- Show the table (A2..C12) ----
+    st.markdown("#### Table (A2:C12)")
+    if table_df.empty:
+        st.info("No data rows found in A2:C12 (excluding any total row).")
+    else:
+        st.dataframe(table_df, use_container_width=True)
+        st.download_button(
+            "Download CSV (table A2:C12)",
+            data=table_df.to_csv(index=False).encode("utf-8"),
+            file_name="cashin_table_A2_C12.csv",
+            mime="text/csv",
+            key="cashin_tbl_dl"
+        )
 
-                # Display: single table (header row already set), with last row visually emphasized via Styler
-                def _style_footer(sdf: pd.DataFrame) -> "pd.io.formats.style.Styler":
-                    if sdf.empty:
-                        return sdf.style
-                    # Build mask for last row
-                    last_idx = sdf.index[-1]
-                    def highlight_last_row(row):
-                        if row.name == last_idx:
-                            return ["font-weight: 700; background-color: #f3f4f6;"] * len(row)
-                        return [""] * len(row)
-                    return sdf.style.apply(highlight_last_row, axis=1)
+    # ---- Show the separate Total row (A13:D13) below the table ----
+    st.markdown("#### Total (A13:D13)")
+    if total_df is None or total_df.empty:
+        st.info("Total row not found. If your sheet has a 'Team' row, it will be shown here; otherwise the last non-empty row is used.")
+    else:
+        st.dataframe(total_df, use_container_width=True)
+        st.download_button(
+            "Download CSV (total A13:D13)",
+            data=total_df.to_csv(index=False).encode("utf-8"),
+            file_name="cashin_total_A13_D13.csv",
+            mime="text/csv",
+            key="cashin_total_dl"
+        )
 
-                # Rebuild the full display (body rows + last footer row)
-                df_display = pd.concat([body_wo_footer, footer_row], ignore_index=False)
+    # Optional: Quick link back to the source sheet
+    with st.expander("Open the source Google Sheet"):
+        st.link_button("Open Google Sheet", sheet_url)
 
-                st.markdown(
-                    """
-                    <style>
-                      .note-muted { color:#6b7280; font-size: 0.85rem; }
-                    </style>
-                    """,
-                    unsafe_allow_html=True
-                )
-                st.markdown("<div class='note-muted'>Header = first row in A2:D13 • Footer (Team total) is fixed at the bottom.</div>", unsafe_allow_html=True)
-
-                st.dataframe(_style_footer(df_display), use_container_width=True)
-
-                # Download exactly what’s shown (no extra rows) — still includes header & the Team total row
-                csv_buf = StringIO()
-                df_display.to_csv(csv_buf, index=False)
-                st.download_button(
-                    "Download CSV — Cash-in (A2:D13, header from first row, Team total at bottom)",
-                    data=csv_buf.getvalue().encode("utf-8"),
-                    file_name="cashin_a2_d13.csv",
-                    mime="text/csv",
-                    key="cashin_dl_csv"
-                )
-
-                # Optional: tiny bar indicator for the first numeric column (if present) excluding footer
-                with st.expander("Quick viz (optional)"):
-                    # Try to detect a numeric column to showcase (exclude non-numeric / footer)
-                    num_cols = []
-                    for c in df_display.columns:
-                        s = pd.to_numeric(df_display[c], errors="coerce")
-                        # numeric if at least half rows are numbers
-                        if s.notna().mean() >= 0.5:
-                            num_cols.append((c, s))
-                    if num_cols:
-                        col_name, s = num_cols[0]
-                        viz_df = body_wo_footer[[df_display.columns[0], col_name]].copy()
-                        viz_df.rename(columns={df_display.columns[0]: "Label", col_name: "Value"}, inplace=True)
-                        viz_df["Value"] = pd.to_numeric(viz_df["Value"], errors="coerce")
-                        viz_df = viz_df.dropna(subset=["Value"])
-                        ch = (
-                            alt.Chart(viz_df)
-                            .mark_bar()
-                            .encode(
-                                x=alt.X("Value:Q"),
-                                y=alt.Y("Label:N", sort="-x"),
-                                tooltip=["Label","Value"]
-                            )
-                            .properties(height=max(160, 22 * len(viz_df)))
-                        )
-                        st.altair_chart(ch, use_container_width=True)
-                    else:
-                        st.caption("No obvious numeric column found for a quick bar viz.")
-        except Exception as e:
-            st.error(f"Error parsing A2:D13: {e}")
 # =========================
 # =========================
 # =========================================
