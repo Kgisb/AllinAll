@@ -167,7 +167,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio(
         "Go to",
-        ["Cash-in", "Dashboard", "MIS", "Funnel", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker", "Marketing Lead Performance & Requirement"],  # ← add this
+        ["Cash-in", "Dashboard", "MIS", "Funnel", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker", "Marketing Lead Performance & Requirement", "Master Graph"],  # ← add this
         index=0
     )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
@@ -8160,3 +8160,299 @@ elif view == "Funnel":
 
     # run it
     _funnel_tab()
+# =========================
+# Master Graph – flexible chart builder (single / combined / ratio)
+# =========================
+elif view == "Master Graph":
+    def _master_graph_tab():
+        st.subheader("Master Graph — Flexible Visuals (MTD / Cohort)")
+
+        # ---------- Resolve columns (defensive)
+        _create = create_col if (create_col in df_f.columns) else find_col(df_f, [
+            "Create Date","Created Date","Deal Create Date","CreateDate","Created On"
+        ])
+        _pay    = pay_col    if (pay_col    in df_f.columns) else find_col(df_f, [
+            "Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"
+        ])
+        _first  = first_cal_sched_col if (first_cal_sched_col in df_f.columns) else find_col(df_f, [
+            "First Calibration Scheduled Date","First Calibration","First Cal Scheduled"
+        ])
+        _resch  = cal_resched_col     if (cal_resched_col     in df_f.columns) else find_col(df_f, [
+            "Calibration Rescheduled Date","Cal Rescheduled","Rescheduled Date"
+        ])
+        _done   = cal_done_col        if (cal_done_col        in df_f.columns) else find_col(df_f, [
+            "Calibration Done Date","Cal Done Date","Calibration Completed"
+        ])
+
+        if not _create or _create not in df_f.columns or not _pay or _pay not in df_f.columns:
+            st.warning("Master Graph needs 'Create Date' and 'Payment Received Date'. Please map them in the sidebar.", icon="⚠️")
+            st.stop()
+
+        # ---------- Controls: mode, scope, granularity
+        c0, c1, c2, c3 = st.columns([1.0, 1.0, 1.1, 1.1])
+        with c0:
+            mode = st.radio("Mode", ["MTD","Cohort"], index=0, horizontal=True, key="mg_mode",
+                            help=("MTD: count events only when the deal was also created in the same period;"
+                                  " Cohort: count events by their own date (create can be anywhere)."))
+        with c1:
+            gran = st.radio("Granularity", ["Day","Week","Month"], index=2, horizontal=True, key="mg_gran")
+        today_d = date.today()
+        with c2:
+            c_start = st.date_input("Create start", value=today_d.replace(day=1), key="mg_cstart")
+        with c3:
+            c_end   = st.date_input("Create end",   value=month_bounds(today_d)[1], key="mg_cend")
+        if c_end < c_start:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+        # ---------- Choose build type & chart type
+        c4, c5 = st.columns([1.2, 1.2])
+        with c4:
+            build_type = st.radio("Build", ["Single metric","Combined (dual-axis)","Derived ratio"], index=0, horizontal=True, key="mg_build")
+        with c5:
+            chart_type = st.selectbox(
+                "Chart type",
+                ["Line","Bar","Area","Stacked Bar","Histogram","Bell Curve"],
+                index=0,
+                key="mg_chart",
+                help="Histogram/Bell Curve apply to daily/period counts of a single metric."
+            )
+
+        # ---------- Normalize event timestamps
+        C = coerce_datetime(df_f[_create])
+        P = coerce_datetime(df_f[_pay])
+        F = coerce_datetime(df_f[_first]) if (_first and _first in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        R = coerce_datetime(df_f[_resch]) if (_resch and _resch in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        D = coerce_datetime(df_f[_done])  if (_done  and _done  in df_f.columns)  else pd.Series(pd.NaT, index=df_f.index)
+
+        # Period keys by granularity
+        def _per(s):
+            ds = pd.to_datetime(s, errors="coerce")
+            if gran == "Day":
+                return ds.dt.floor("D")
+            if gran == "Week":
+                # ISO week start Monday
+                return (ds - pd.to_timedelta(ds.dt.weekday, unit="D")).dt.floor("D")
+            return ds.dt.to_period("M").dt.to_timestamp()
+
+        perC, perP, perF, perR, perD = _per(C), _per(P), _per(F), _per(R), _per(D)
+
+        # Universe = created within [c_start, c_end]
+        C_date = C.dt.date
+        in_window = C_date.notna() & (C_date >= c_start) & (C_date <= c_end)
+
+        # MTD requires event period == create period; Cohort uses event’s own period
+        sameP = perC == perP
+        sameF = perC == perF
+        sameR = perC == perR
+        sameD = perC == perD
+
+        if mode == "MTD":
+            m_created = in_window & C.notna()
+            m_enrol   = in_window & P.notna() & sameP
+            m_first   = in_window & F.notna() & sameF
+            m_resch   = in_window & R.notna() & sameR
+            m_done    = in_window & D.notna() & sameD
+        else:
+            m_created = in_window & C.notna()
+            m_enrol   = in_window & P.notna()
+            m_first   = in_window & F.notna()
+            m_resch   = in_window & R.notna()
+            m_done    = in_window & D.notna()
+
+        # Metric → (period_series, mask)
+        metric_defs = {
+            "Deals Created":              (perC, m_created),
+            "Enrolments":                 (perP, m_enrol),
+            "First Cal Scheduled":        (perF, m_first),
+            "Cal Rescheduled":            (perR, m_resch),
+            "Cal Done":                   (perD, m_done),
+        }
+        metric_names = list(metric_defs.keys())
+
+        # ---------- Metric pickers (depend on build type)
+        if build_type == "Single metric":
+            m1 = st.selectbox("Metric", metric_names, index=0, key="mg_m1")
+        elif build_type == "Combined (dual-axis)":
+            cA, cB = st.columns(2)
+            with cA:
+                m1 = st.selectbox("Left Y", metric_names, index=0, key="mg_m1l")
+            with cB:
+                m2 = st.selectbox("Right Y", [m for m in metric_names if m != m1], index=0, key="mg_m2r")
+        else:  # Derived ratio
+            cA, cB = st.columns(2)
+            with cA:
+                num_m = st.selectbox("Numerator", metric_names, index=1, key="mg_num")
+            with cB:
+                den_m = st.selectbox("Denominator", [m for m in metric_names if m != num_m], index=0, key="mg_den")
+            as_pct = st.checkbox("Show as % (×100)", value=True, key="mg_ratio_pct")
+
+        # ---------- Helpers to aggregate counts by period
+        def _count_series(per_s, mask, label):
+            if mask is None or not mask.any():
+                return pd.DataFrame(columns=["Period", label])
+            df = pd.DataFrame({"Period": per_s[mask]})
+            if df.empty:
+                return pd.DataFrame(columns=["Period", label])
+            return df.assign(_one=1).groupby("Period")["_one"].sum().rename(label).reset_index()
+
+        # ---------- Build outputs
+        if build_type == "Single metric":
+            per_s, msk = metric_defs[m1]
+            counts = _count_series(per_s, msk, m1)
+
+            # Graph / Histogram / Bell
+            view = st.radio("View as", ["Graph","Table"], index=0, horizontal=True, key="mg_view_single")
+
+            if view == "Table":
+                st.dataframe(counts.sort_values("Period"), use_container_width=True)
+                st.download_button("Download CSV", counts.sort_values("Period").to_csv(index=False).encode("utf-8"),
+                                   "master_graph_single.csv","text/csv", key="mg_dl_single")
+            else:
+                if chart_type in {"Histogram","Bell Curve"}:
+                    # Build distribution of period counts (e.g., daily counts)
+                    vals = counts[m1].astype(float)
+                    if vals.empty:
+                        st.info("No data to plot a distribution.")
+                    else:
+                        hist = alt.Chart(counts).mark_bar(opacity=0.9).encode(
+                            x=alt.X(f"{m1}:Q", bin=alt.Bin(maxbins=30), title=f"{m1} per {gran}"),
+                            y=alt.Y("count():Q", title="Frequency"),
+                            tooltip=[alt.Tooltip("count():Q", title="Freq")]
+                        ).properties(height=320, title=f"Histogram — {m1} per {gran}")
+
+                        if chart_type == "Bell Curve":
+                            mu  = float(vals.mean())
+                            sig = float(vals.std(ddof=0)) if len(vals) > 1 else 0.0
+                            # synthetic normal
+                            xs = np.linspace(max(0, vals.min()), vals.max() if vals.max()>0 else 1.0, 200)
+                            # scale PDF to same area ~ total count of bars
+                            pdf = (1.0/(sig*np.sqrt(2*np.pi)) * np.exp(-0.5*((xs-mu)/max(sig,1e-9))**2)) if sig>0 else np.zeros_like(xs)
+                            pdf = pdf / pdf.max() * counts["count()"].max() if (sig>0 and "count()" in counts.columns) else pdf
+                            bell_df = pd.DataFrame({"x": xs, "pdf": pdf})
+                            bell = alt.Chart(bell_df).mark_line().encode(
+                                x=alt.X("x:Q", title=f"{m1} per {gran}"),
+                                y=alt.Y("pdf:Q", title="Density (scaled)")
+                            )
+                            st.altair_chart(hist + bell, use_container_width=True)
+                            st.caption(f"μ = {mu:.2f}, σ = {sig:.2f}")
+                        else:
+                            st.altair_chart(hist, use_container_width=True)
+                else:
+                    mark = {"Line":"line","Bar":"bar","Area":"area","Stacked Bar":"bar"}.get(chart_type, "line")
+                    base = alt.Chart(counts)
+                    ch = (
+                        base.mark_line(point=True) if mark=="line" else
+                        base.mark_area(opacity=0.5) if mark=="area" else
+                        base.mark_bar(opacity=0.9)
+                    ).encode(
+                        x=alt.X("Period:T", title="Period"),
+                        y=alt.Y(f"{m1}:Q", title=m1),
+                        tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                 alt.Tooltip(f"{m1}:Q", format="d")]
+                    ).properties(height=360, title=f"{m1} by {gran}")
+                    st.altair_chart(ch, use_container_width=True)
+
+        elif build_type == "Combined (dual-axis)":
+            per1, m1_mask = metric_defs[m1]
+            per2, m2_mask = metric_defs[m2]
+            s1 = _count_series(per1, m1_mask, m1)
+            s2 = _count_series(per2, m2_mask, m2)
+            combined = s1.merge(s2, on="Period", how="outer").fillna(0)
+
+            view = st.radio("View as", ["Graph","Table"], index=0, horizontal=True, key="mg_view_combo")
+            if view == "Table":
+                st.dataframe(combined.sort_values("Period"), use_container_width=True)
+                st.download_button("Download CSV", combined.sort_values("Period").to_csv(index=False).encode("utf-8"),
+                                   "master_graph_combined.csv","text/csv", key="mg_dl_combined")
+            else:
+                # Dual-axis with layering (left = bars/line, right = line)
+                if chart_type == "Bar":
+                    left = alt.Chart(combined).mark_bar(opacity=0.85).encode(
+                        x=alt.X("Period:T", title="Period"),
+                        y=alt.Y(f"{m1}:Q", title=m1),
+                        tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                 alt.Tooltip(f"{m1}:Q", format="d")]
+                    )
+                elif chart_type == "Area":
+                    left = alt.Chart(combined).mark_area(opacity=0.5).encode(
+                        x=alt.X("Period:T"), y=alt.Y(f"{m1}:Q", title=m1),
+                        tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                 alt.Tooltip(f"{m1}:Q", format="d")]
+                    )
+                else:
+                    left = alt.Chart(combined).mark_line(point=True).encode(
+                        x=alt.X("Period:T"), y=alt.Y(f"{m1}:Q", title=m1),
+                        tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                 alt.Tooltip(f"{m1}:Q", format="d")]
+                    )
+
+                right = alt.Chart(combined).mark_line(point=True).encode(
+                    x=alt.X("Period:T"),
+                    y=alt.Y(f"{m2}:Q", title=m2, axis=alt.Axis(orient="right")),
+                    tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                             alt.Tooltip(f"{m2}:Q", format="d")]
+                )
+
+                st.altair_chart(alt.layer(left, right).resolve_scale(y='independent').properties(height=360,
+                                  title=f"{m1} (left) + {m2} (right) by {gran}"), use_container_width=True)
+
+        else:
+            # Derived ratio
+            perN, maskN = metric_defs[num_m]
+            perD, maskD = metric_defs[den_m]
+            sN = _count_series(perN, maskN, "Num")
+            sD = _count_series(perD, maskD, "Den")
+            ratio = sN.merge(sD, on="Period", how="outer").fillna(0.0)
+            ratio["Value"] = np.where(ratio["Den"]>0, ratio["Num"]/ratio["Den"], np.nan)
+            if as_pct:
+                ratio["Value"] = ratio["Value"] * 100.0
+
+            label = f"{num_m} / {den_m}" + (" (%)" if as_pct else "")
+            ratio = ratio.rename(columns={"Value": label})
+
+            view = st.radio("View as", ["Graph","Table"], index=0, horizontal=True, key="mg_view_ratio")
+            if view == "Table":
+                st.dataframe(ratio[["Period", label]].sort_values("Period"), use_container_width=True)
+                st.download_button("Download CSV", ratio[["Period", label]].sort_values("Period").to_csv(index=False).encode("utf-8"),
+                                   "master_graph_ratio.csv","text/csv", key="mg_dl_ratio")
+            else:
+                if chart_type in {"Histogram","Bell Curve"}:
+                    vals = ratio[label].dropna().astype(float)
+                    if vals.empty:
+                        st.info("No data to plot a distribution.")
+                    else:
+                        hist = alt.Chart(ratio.dropna()).mark_bar(opacity=0.9).encode(
+                            x=alt.X(f"{label}:Q", bin=alt.Bin(maxbins=30), title=label),
+                            y=alt.Y("count():Q", title="Frequency"),
+                            tooltip=[alt.Tooltip("count():Q", title="Freq")]
+                        ).properties(height=320, title=f"Histogram — {label}")
+                        if chart_type == "Bell Curve":
+                            mu  = float(vals.mean())
+                            sig = float(vals.std(ddof=0)) if len(vals) > 1 else 0.0
+                            xs = np.linspace(vals.min(), vals.max() if vals.max()!=vals.min() else vals.min()+1.0, 200)
+                            pdf = (1.0/(sig*np.sqrt(2*np.pi)) * np.exp(-0.5*((xs-mu)/max(sig,1e-9))**2)) if sig>0 else np.zeros_like(xs)
+                            pdf = pdf / pdf.max() *  (ratio["count()"].max() if "count()" in ratio.columns else 1.0)
+                            bell_df = pd.DataFrame({"x": xs, "pdf": pdf})
+                            bell = alt.Chart(bell_df).mark_line().encode(x="x:Q", y="pdf:Q")
+                            st.altair_chart(hist + bell, use_container_width=True)
+                            st.caption(f"μ = {mu:.3f}, σ = {sig:.3f}")
+                        else:
+                            st.altair_chart(hist, use_container_width=True)
+                else:
+                    mark = {"Line":"line","Bar":"bar","Area":"area","Stacked Bar":"bar"}.get(chart_type, "line")
+                    base = alt.Chart(ratio)
+                    ch = (
+                        base.mark_line(point=True) if mark=="line" else
+                        base.mark_area(opacity=0.5) if mark=="area" else
+                        base.mark_bar(opacity=0.9)
+                    ).encode(
+                        x=alt.X("Period:T", title="Period"),
+                        y=alt.Y(f"{label}:Q", title=label),
+                        tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                 alt.Tooltip(f"{label}:Q", format=".2f" if as_pct else ".3f")]
+                    ).properties(height=360, title=f"{label} by {gran}")
+                    st.altair_chart(ch, use_container_width=True)
+
+    # run it
+    _master_graph_tab()
