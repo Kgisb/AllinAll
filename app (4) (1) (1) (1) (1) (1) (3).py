@@ -8869,7 +8869,8 @@ elif view == "Daily Business":
     )
 
 # =========================
-# Business Projection (add 2 ML models + Accuracy %)
+# =========================
+# Business Projection (no sklearn; 3 models + Accuracy %)
 # =========================
 elif view == "Business Projection":
     def _business_projection_tab():
@@ -8878,12 +8879,7 @@ elif view == "Business Projection":
         from calendar import monthrange
         import altair as alt
 
-        # sklearn models (all standard libs)
-        from sklearn.linear_model import Ridge, Lasso
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.metrics import mean_absolute_percentage_error
-
-        st.subheader("Business Projection — Monthly Enrolment Forecast (with model selection & Accuracy %)")
+        st.subheader("Business Projection — Monthly Enrolment Forecast (model selection & Accuracy %, no sklearn)")
 
         # ---------- Resolve columns ----------
         def _pick(df, preferred, cands):
@@ -8913,9 +8909,9 @@ elif view == "Business Projection":
             model_name = st.selectbox(
                 "Model",
                 [
-                    "Ridge (lags + seasonality)",
-                    "Lasso (lags + seasonality)",
-                    "Random Forest (lags + seasonality)"
+                    "Ridge (NumPy, lags + seasonality)",
+                    "Holt-Winters Additive (s=12)",
+                    "Naive Seasonal (month mean)"
                 ],
                 index=0
             )
@@ -8938,7 +8934,7 @@ elif view == "Business Projection":
         dfp = dfp[dfp["_P"].notna()].copy()
         dfp["_PM"] = dfp["_P"].dt.to_period("M")
 
-        y = dfp.groupby("_PM").size().rename("Enrolments").sort_index()  # PeriodIndex -> counts
+        y = dfp.groupby("_PM").size().rename("Enrolments").sort_index()
         if y.empty:
             st.info("No payments found to build a monthly series.")
             st.stop()
@@ -8947,105 +8943,209 @@ elif view == "Business Projection":
         full_idx = pd.period_range(start=y.index.min(), end=y.index.max(), freq="M")
         y = y.reindex(full_idx, fill_value=0)
 
-        # ---------- Design matrix: lags + month-of-year dummies ----------
+        # ---------- Helpers (design, ridge, holt-winters, naive) ----------
         def build_design(y_ser: pd.Series, max_lag: int):
+            """Return X (lags + month dummies) and y (aligned), dropping initial NaNs."""
             dfX = pd.DataFrame({"y": y_ser.astype(float)})
             for L in range(1, max_lag+1):
                 dfX[f"lag_{L}"] = dfX["y"].shift(L)
-
-            # Month-of-year dummies (1..12) from PeriodIndex
             months = pd.Series([p.month for p in dfX.index], index=dfX.index, name="month")
             dummies = pd.get_dummies(months.astype("category"), prefix="m", drop_first=True)
             dfX = pd.concat([dfX, dummies], axis=1)
-
-            # drop initial NaNs due to lagging
             dfX = dfX.dropna()
             X = dfX.drop(columns=["y"])
             y_out = dfX["y"]
             return X, y_out
 
+        def ridge_fit_predict(X_tr, y_tr, X_te, alpha=2.0):
+            """Closed-form ridge: (X'X + aI)^-1 X'y"""
+            X = X_tr.to_numpy(dtype=float)
+            yv = y_tr.to_numpy(dtype=float)
+            # Add small ridge on all features
+            XtX = X.T @ X
+            n_feat = XtX.shape[0]
+            A = XtX + alpha * np.eye(n_feat)
+            beta = np.linalg.solve(A, X.T @ yv)
+            yhat = (X_te.to_numpy(dtype=float) @ beta).astype(float)
+            return yhat
+
+        def holt_winters_additive(y_series: pd.Series, season_len=12, alphas=(0.2,0.4,0.6,0.8), betas=(0.1,0.2), gammas=(0.1,0.2)):
+            """
+            Minimal additive Holt-Winters with tiny grid-search.
+            Returns (fitted, params) and you can forecast next step using last states.
+            """
+            yv = y_series.astype(float).values
+            n = len(yv)
+            if n < season_len + 5:
+                # not enough data, fallback to simple mean
+                return np.full(n, yv.mean()), (np.nan, np.nan, np.nan)
+
+            best_mse = np.inf
+            best_fit = None
+            best_params = None
+
+            # initial components
+            season_init = np.array([yv[i] - yv[:season_len].mean() for i in range(season_len)], dtype=float)
+            for a in alphas:
+                for b in betas:
+                    for g in gammas:
+                        L = yv[:season_len].mean()
+                        T = (yv[season_len:2*season_len].mean() - yv[:season_len].mean()) / season_len
+                        S = season_init.copy()
+                        fit = np.zeros(n, dtype=float)
+                        for t in range(n):
+                            s_idx = t % season_len
+                            prev_L = L
+                            prev_T = T
+                            prev_S = S[s_idx]
+                            # Additive HW recursions
+                            L = a * (yv[t] - S[s_idx]) + (1 - a) * (prev_L + prev_T)
+                            T = b * (L - prev_L) + (1 - b) * prev_T
+                            S[s_idx] = g * (yv[t] - L) + (1 - g) * S[s_idx]
+                            fit[t] = L + T + S[s_idx]
+
+                        mse = np.mean((fit[season_len:] - yv[season_len:])**2)  # ignore warm-up
+                        if mse < best_mse:
+                            best_mse = mse
+                            best_fit = fit
+                            best_params = (a, b, g)
+            return best_fit, best_params
+
+        def holt_winters_forecast_next(y_series: pd.Series, season_len=12, params=(0.4,0.2,0.1)):
+            """One-step-ahead forecast using last states under chosen parameters."""
+            yv = y_series.astype(float).values
+            n = len(yv)
+            a, b, g = params
+            if n < season_len + 5 or any(np.isnan([a,b,g])):
+                return float(yv.mean())
+            # initialize
+            L = yv[:season_len].mean()
+            T = (yv[season_len:2*season_len].mean() - yv[:season_len].mean()) / season_len
+            S = np.array([yv[i] - yv[:season_len].mean() for i in range(season_len)], dtype=float)
+            for t in range(n):
+                s_idx = t % season_len
+                prev_L = L
+                prev_T = T
+                # update
+                L = a * (yv[t] - S[s_idx]) + (1 - a) * (prev_L + prev_T)
+                T = b * (L - prev_L) + (1 - b) * prev_T
+                S[s_idx] = g * (yv[t] - L) + (1 - g) * S[s_idx]
+            # next step index (n) uses s_idx = n % season_len
+            s_idx_next = n % season_len
+            return float(L + T + S[s_idx_next])
+
+        def naive_seasonal_forecast(y_series: pd.Series, target_per):
+            """Mean of same month across previous years; blend with recent mean."""
+            month = target_per.month
+            idx = y_series.index
+            same_month_vals = [y_series[p] for p in idx if p.month == month]
+            if len(same_month_vals) == 0:
+                return float(y_series.mean())
+            sm_mean = float(np.mean(same_month_vals))
+            recent_mean = float(y_series.iloc[-min(12, len(y_series)):].mean())
+            # blend (0.7 seasonal + 0.3 recent)
+            return 0.7 * sm_mean + 0.3 * recent_mean
+
         # ---------- Backtest (rolling-origin) to compute Accuracy % ----------
-        # We test only on the last K full months before the current month (exclude current)
         today_per = pd.Period(date.today(), freq="M")
         hist_end = min(y.index.max(), today_per - 1)  # last complete month
         hist_start = max(y.index.min(), hist_end - (lookback - 1))
         y_hist = y.loc[hist_start:hist_end].copy()
 
-        def make_model(name: str):
-            if name.startswith("Ridge"):
-                return Ridge(alpha=2.0, random_state=42)
-            if name.startswith("Lasso"):
-                return Lasso(alpha=0.5, random_state=42, max_iter=10000)
-            # Random Forest
-            return RandomForestRegressor(
-                n_estimators=500, max_depth=None, min_samples_leaf=2,
-                random_state=42
-            )
-
-        model = make_model(model_name)
-
-        # Backtest strategy: expanding-window, predict one-step ahead
         preds_bt, actual_bt, idx_bt = [], [], []
-        # Build full design once (we will slice)
-        X_full, y_full = build_design(y, max_lag=max_lag)
-        # Convert indices to Periods to align
-        idx_full = X_full.index
 
-        # Define the backtest target index (periods we will predict)
-        bt_periods = [p for p in y_hist.index if p in idx_full]  # ensure design exists
-        for t in bt_periods:
-            # train end = previous month of t
-            train_end_pos = np.where(idx_full < t)[0]
-            if len(train_end_pos) == 0:  # no training rows yet
-                continue
-            train_mask = idx_full < t
-            X_tr, y_tr = X_full.loc[train_mask], y_full.loc[train_mask]
+        if model_name.startswith("Ridge"):
+            # Build full design once
+            X_full, y_full = build_design(y, max_lag=max_lag)
+            idx_full = X_full.index
+            bt_periods = [p for p in y_hist.index if p in idx_full]
+            for t in bt_periods:
+                train_mask = idx_full < t
+                if train_mask.sum() < max(8, max_lag + 4):  # not enough rows
+                    continue
+                X_tr, y_tr = X_full.loc[train_mask], y_full.loc[train_mask]
+                yhat = ridge_fit_predict(X_tr, y_tr, X_full.loc[[t]], alpha=2.0)[0]
+                preds_bt.append(max(0.0, float(yhat)))
+                actual_bt.append(float(y.loc[t]))
+                idx_bt.append(t)
 
-            # if too small to fit
-            if len(X_tr) < max(8, max_lag + 4):
-                continue
+        elif model_name.startswith("Holt-Winters"):
+            # For each backtest month, fit HW on all data up to t-1, predict t
+            for t in y_hist.index:
+                y_tr = y.loc[:(t - 1)]
+                if len(y_tr) < 18:  # guard
+                    continue
+                fit, params = holt_winters_additive(y_tr, season_len=12)
+                yhat = holt_winters_forecast_next(y_tr, season_len=12, params=params)
+                preds_bt.append(max(0.0, float(yhat)))
+                actual_bt.append(float(y.loc[t]))
+                idx_bt.append(t)
 
-            # fit & predict t
-            model.fit(X_tr, y_tr)
-            if t not in X_full.index:  # safety
-                continue
-            y_hat = float(model.predict(X_full.loc[[t]])[0])
-            preds_bt.append(max(0.0, y_hat))
-            actual_bt.append(float(y.loc[t]))
-            idx_bt.append(t)
+        else:  # Naive Seasonal
+            for t in y_hist.index:
+                y_tr = y.loc[:(t - 1)]
+                if len(y_tr) < 6:
+                    continue
+                yhat = naive_seasonal_forecast(y_tr, t)
+                preds_bt.append(max(0.0, float(yhat)))
+                actual_bt.append(float(y.loc[t]))
+                idx_bt.append(t)
 
         if preds_bt and actual_bt:
             # Accuracy % from MAPE (clip to [0, 100])
-            mape = mean_absolute_percentage_error(actual_bt, preds_bt)
-            acc_pct = max(0.0, min(100.0, 100.0 * (1.0 - mape)))
+            actual_arr = np.array(actual_bt, dtype=float)
+            pred_arr   = np.array(preds_bt, dtype=float)
+            denom = np.where(actual_arr == 0, np.nan, actual_arr)
+            ape = np.abs(pred_arr - actual_arr) / denom
+            mape = np.nanmean(ape)
+            acc_pct = max(0.0, min(100.0, 100.0 * (1.0 - (mape if np.isfinite(mape) else 1.0))))
         else:
             acc_pct = np.nan
 
-        # ---------- Fit on all available history & produce forecast for chosen month ----------
-        # Ensure the target month exists in the design index (append zeros into y if needed)
-        last_hist_per = y.index.max()
+        # ---------- Fit on all history & forecast for chosen month ----------
         tgt_per = pd.Period(target_month, freq="M")
-        if tgt_per > last_hist_per:
-            # extend y up to target with zeros to allow feature creation (lags will use history)
-            extend_idx = pd.period_range(start=y.index.min(), end=tgt_per, freq="M")
-            y_ext = y.reindex(extend_idx, fill_value=0.0)
-        else:
-            y_ext = y.copy()
-
-        X_all, y_all = build_design(y_ext, max_lag=max_lag)
-        # Only predict if target in X_all index
         forecast_val = None
-        if tgt_per in X_all.index and len(X_all) >= max(8, max_lag + 4):
-            model = make_model(model_name)  # fresh instance
-            # train using all rows prior to target month
-            train_mask = X_all.index < tgt_per
-            if train_mask.sum() >= max(8, max_lag + 4):
-                model.fit(X_all.loc[train_mask], y_all.loc[train_mask])
-                forecast_val = float(model.predict(X_all.loc[[tgt_per]])[0])
-                if forecast_val < 0:
-                    forecast_val = 0.0
 
-        # ---------- Chart (history + backtest preds + forecast) ----------
+        if model_name.startswith("Ridge"):
+            # Extend y with zeros to reach target month so design exists
+            if tgt_per > y.index.max():
+                extend_idx = pd.period_range(start=y.index.min(), end=tgt_per, freq="M")
+                y_ext = y.reindex(extend_idx, fill_value=0.0)
+            else:
+                y_ext = y.copy()
+            X_all, y_all = build_design(y_ext, max_lag=max_lag)
+            if tgt_per in X_all.index:
+                train_mask = X_all.index < tgt_per
+                if train_mask.sum() >= max(8, max_lag + 4):
+                    yhat = ridge_fit_predict(X_all.loc[train_mask], y_all.loc[train_mask],
+                                             X_all.loc[[tgt_per]], alpha=2.0)[0]
+                    forecast_val = max(0.0, float(yhat))
+
+        elif model_name.startswith("Holt-Winters"):
+            if len(y) >= 18:
+                fit, params = holt_winters_additive(y, season_len=12)
+                # If target is the next month after history, just 1-step ahead
+                if tgt_per == (y.index.max() + 1):
+                    forecast_val = max(0.0, float(holt_winters_forecast_next(y, season_len=12, params=params)))
+                else:
+                    # roll forward multiple months
+                    y_tmp = y.copy()
+                    while y_tmp.index.max() < tgt_per:
+                        nxt = holt_winters_forecast_next(y_tmp, season_len=12, params=params)
+                        # append as next period
+                        y_tmp = pd.concat([y_tmp, pd.Series([max(0.0, float(nxt))], index=[y_tmp.index.max()+1])])
+                    forecast_val = float(y_tmp.loc[tgt_per])
+
+        else:  # Naive Seasonal
+            if len(y) >= 6:
+                # roll forward if needed
+                y_tmp = y.copy()
+                while y_tmp.index.max() < tgt_per:
+                    nxt = naive_seasonal_forecast(y_tmp, y_tmp.index.max()+1)
+                    y_tmp = pd.concat([y_tmp, pd.Series([max(0.0, float(nxt))], index=[y_tmp.index.max()+1])])
+                forecast_val = float(y_tmp.loc[tgt_per])
+
+        # ---------- Chart (history + backtest + forecast) ----------
         chart_rows = []
         if "History" in show_components:
             for per, v in y.items():
@@ -9089,7 +9189,7 @@ elif view == "Business Projection":
             st.markdown(
                 f"<div class='kpi-card'><div class='kpi-title'>Model</div>"
                 f"<div class='kpi-value'>{model_name}</div>"
-                f"<div class='kpi-sub'>lags={max_lag}, lookback={lookback}m</div></div>",
+                f"<div class='kpi-sub'>lags={max_lag if model_name.startswith('Ridge') else '—'}, lookback={lookback}m</div></div>",
                 unsafe_allow_html=True
             )
         with k2:
@@ -9101,9 +9201,7 @@ elif view == "Business Projection":
                 unsafe_allow_html=True
             )
         with k3:
-            f_txt = "–"
-            if forecast_val is not None:
-                f_txt = f"{forecast_val:.1f}"
+            f_txt = "–" if forecast_val is None else f"{forecast_val:.1f}"
             st.markdown(
                 f"<div class='kpi-card'><div class='kpi-title'>Forecast for {str(tgt_per)}</div>"
                 f"<div class='kpi-value'>{f_txt}</div>"
@@ -9179,4 +9277,5 @@ elif view == "Business Projection":
 
     # run it
     _business_projection_tab()
+
 
