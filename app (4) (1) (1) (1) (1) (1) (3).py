@@ -5377,6 +5377,9 @@ elif view == "Deal Decay":
 # =========================
 # Sales Tracker (with Day-wise view added)
 # =========================
+# =========================
+# Sales Tracker Tab (added "Monthly" granularity; everything else kept identical)
+# =========================
 elif view == "Sales Tracker":
     def _sales_tracker_tab():
         st.subheader("Sales Tracker — Counsellor / Source / Country (MTD & Cohort) + Day-wise")
@@ -5413,7 +5416,8 @@ elif view == "Sales Tracker":
         with c1:
             scope = st.radio("Date scope", ["Today", "Yesterday", "This month", "Last month", "Custom"], index=2, horizontal=True, key="st_scope")
         with c2:
-            gran = st.radio("Granularity", ["Summary", "Day-wise"], index=0, horizontal=True, key="st_gran")  # NEW
+            # ADDED: "Monthly" keeps everything else intact
+            gran = st.radio("Granularity", ["Summary", "Day-wise", "Monthly"], index=0, horizontal=True, key="st_gran")
         with c3:
             chart_type = st.selectbox("Chart", ["Bar", "Line"], index=1, key="st_chart")
 
@@ -5572,7 +5576,7 @@ elif view == "Sales Tracker":
         # ==========
         # Day-wise
         # ==========
-        else:
+        elif gran == "Day-wise":
             st.markdown("### Day-wise — by Academic Counsellor")
 
             # Build a day-wise frame for each metric with the correct date basis
@@ -5699,8 +5703,150 @@ elif view == "Sales Tracker":
                 key="st_dl_daywise"
             )
 
+        # ==========
+        # Monthly (ADDED)
+        # ==========
+        else:
+            st.markdown("### Monthly — by Academic Counsellor")
+
+            # Build a month-wise frame for each metric with the correct date basis
+            def _monthly():
+                frames = []
+
+                # Helper to convert date series to month-start timestamps
+                def to_month_start(s):
+                    s2 = pd.to_datetime(s, errors="coerce")
+                    return s2.dt.to_period("M").dt.to_timestamp()
+
+                # Deals Created (Create date month)
+                idx1 = base_mask & m_created
+                d1 = pd.DataFrame({
+                    "Month": to_month_start(C[idx1]),
+                    "Counsellor": CNS[idx1],
+                    "Metric": "Deals Created",
+                })
+                frames.append(d1)
+
+                # Enrolments (Payment date month, mode already in m_enrol)
+                idx2 = base_mask & m_enrol
+                d2 = pd.DataFrame({
+                    "Month": to_month_start(P[idx2]),
+                    "Counsellor": CNS[idx2],
+                    "Metric": "Enrolments",
+                })
+                frames.append(d2)
+
+                # First Cal
+                if m_first_eff is not None:
+                    idx3 = base_mask & m_first_eff
+                    d3 = pd.DataFrame({
+                        "Month": to_month_start(F[idx3]),
+                        "Counsellor": CNS[idx3],
+                        "Metric": "First Cal Scheduled",
+                    })
+                    frames.append(d3)
+
+                # Rescheduled
+                if m_resch_eff is not None:
+                    idx4 = base_mask & m_resch_eff
+                    d4 = pd.DataFrame({
+                        "Month": to_month_start(R[idx4]),
+                        "Counsellor": CNS[idx4],
+                        "Metric": "Cal Rescheduled",
+                    })
+                    frames.append(d4)
+
+                # Done
+                if m_done_eff is not None:
+                    idx5 = base_mask & m_done_eff
+                    d5 = pd.DataFrame({
+                        "Month": to_month_start(D[idx5]),
+                        "Counsellor": CNS[idx5],
+                        "Metric": "Cal Done",
+                    })
+                    frames.append(d5)
+
+                # Sales Generated (RIS)
+                idx6 = base_mask & m_sales_gen
+                d6 = pd.DataFrame({
+                    "Month": to_month_start(P[idx6]),
+                    "Counsellor": CNS[idx6],
+                    "Metric": "Sales Generated (RIS)",
+                })
+                frames.append(d6)
+
+                df_all = pd.concat([f for f in frames if not f.empty], ignore_index=True) if frames else pd.DataFrame(columns=["Month","Counsellor","Metric"])
+                if df_all.empty:
+                    return df_all
+
+                df_all["Month"] = pd.to_datetime(df_all["Month"])
+                g = df_all.groupby(["Counsellor","Month","Metric"], observed=True).size().rename("Count").reset_index()
+                return g
+
+            mon = _monthly()
+            if mon.empty:
+                st.info("No monthly data for the selected filters/date range.")
+                st.stop()
+
+            # Pick metric(s) to plot
+            all_metrics_m = mon["Metric"].unique().tolist()
+            msel_m = st.multiselect("Metrics", options=all_metrics_m, default=all_metrics_m[:2], key="st_month_metrics")
+
+            mon_show = mon[mon["Metric"].isin(msel_m)].copy()
+            mon_show["Month"] = pd.to_datetime(mon_show["Month"])
+
+            # Chart
+            if chart_type == "Bar":
+                chm = (
+                    alt.Chart(mon_show)
+                    .mark_bar(opacity=0.9)
+                    .encode(
+                        x=alt.X("yearmonth(Month):T", title="Month"),
+                        y=alt.Y("Count:Q", title="Count"),
+                        color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
+                        column=alt.Column("Counsellor:N", title="Academic Counsellor"),
+                        tooltip=[alt.Tooltip("yearmonth(Month):T", title="Month"),
+                                 alt.Tooltip("Counsellor:N"),
+                                 alt.Tooltip("Metric:N"),
+                                 alt.Tooltip("Count:Q")]
+                    )
+                    .properties(height=220)
+                )
+            else:
+                chm = (
+                    alt.Chart(mon_show)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("yearmonth(Month):T", title="Month"),
+                        y=alt.Y("Count:Q", title="Count"),
+                        color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
+                        facet=alt.Facet("Counsellor:N", title="Academic Counsellor", columns=2),
+                        tooltip=[alt.Tooltip("yearmonth(Month):T", title="Month"),
+                                 alt.Tooltip("Counsellor:N"),
+                                 alt.Tooltip("Metric:N"),
+                                 alt.Tooltip("Count:Q")]
+                    )
+                    .properties(height=220)
+                )
+
+            st.altair_chart(chm, use_container_width=True)
+
+            # Table + Download
+            st.dataframe(
+                mon_show.sort_values(["Counsellor","Month","Metric"]),
+                use_container_width=True
+            )
+            st.download_button(
+                "Download CSV — Monthly Counsellor Metrics",
+                mon_show.sort_values(["Counsellor","Month","Metric"]).to_csv(index=False).encode("utf-8"),
+                "sales_tracker_monthly_counsellor.csv",
+                "text/csv",
+                key="st_dl_monthly"
+            )
+
     # run it
     _sales_tracker_tab()
+
 # =========================
 # Deal Velocity Tab (full)
 # =========================
