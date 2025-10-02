@@ -167,7 +167,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio(
         "Go to",
-        ["Cash-in", "Dashboard", "MIS", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker", "Marketing Lead Performance & Requirement"],  # ← add this
+        ["Cash-in", "Dashboard", "MIS", "Funnel", "Predictibility", "Referrals", "Sales Tracker", "AC Wise Detail", "Trend & Analysis", "80-20", "Stuck deals", "Deal Velocity", "Buying Propensity", "Carry Forward", "Lead Movement", "Deal Decay", "Bubble Explorer", "Heatmap", "HubSpot Deal Score tracker", "Marketing Lead Performance & Requirement"],  # ← add this
         index=0
     )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
@@ -7740,3 +7740,423 @@ elif view == "Marketing Lead Performance & Requirement":
                 st.altair_chart(ch2, use_container_width=True)
 
     _mlpr_tab()
+# =========================
+# Funnel Tab (comprehensive time/dimension funnel with derived rates & Pre-Book split)
+# =========================
+elif view == "Funnel":
+    def _funnel_tab():
+        st.subheader("Funnel — Leads → Trials → Enrolments (MTD / Cohort)")
+
+        # ---------- Resolve columns defensively ----------
+        _create = create_col if (create_col in df_f.columns) else find_col(df_f, [
+            "Create Date","Created Date","Deal Create Date","CreateDate","Created On"
+        ])
+        _pay    = pay_col    if (pay_col    in df_f.columns) else find_col(df_f, [
+            "Payment Received Date","Payment Date","Enrolment Date","PaymentReceivedDate","Paid On"
+        ])
+        _first  = first_cal_sched_col if (first_cal_sched_col in df_f.columns) else find_col(df_f, [
+            "First Calibration Scheduled Date","First Calibration","First Cal Scheduled"
+        ])
+        _resch  = cal_resched_col     if (cal_resched_col     in df_f.columns) else find_col(df_f, [
+            "Calibration Rescheduled Date","Cal Rescheduled","Rescheduled Date"
+        ])
+        _done   = cal_done_col        if (cal_done_col        in df_f.columns) else find_col(df_f, [
+            "Calibration Done Date","Cal Done Date","Calibration Completed"
+        ])
+        _slot   = find_col(df_f, ["Calibration Slot (Deal)","Calibration Slot","Cal Slot (Deal)"])
+
+        _cty    = country_col     if (country_col     in df_f.columns) else find_col(df_f, ["Country","Student Country","Deal Country"])
+        _cns    = counsellor_col  if (counsellor_col  in df_f.columns) else find_col(df_f, ["Academic Counsellor","Counsellor","Advisor"])
+        _src    = source_col      if (source_col      in df_f.columns) else find_col(df_f, ["JetLearn Deal Source","Deal Source","Source"])
+
+        if not _create or _create not in df_f.columns or not _pay or _pay not in df_f.columns:
+            st.warning("Funnel needs 'Create Date' and 'Payment Received Date'. Please map them in the sidebar.", icon="⚠️")
+            st.stop()
+
+        # ---------- Controls ----------
+        c0, c1, c2 = st.columns([1.0, 1.1, 1.1])
+        with c0:
+            mode = st.radio(
+                "Mode", ["MTD", "Cohort"], index=0, horizontal=True, key="fn_mode",
+                help=("MTD: count events only when the deal was also created in that same period.\n"
+                      "Cohort: count events by their own date (create date can be anywhere).")
+            )
+        with c1:
+            gran = st.radio("Granularity", ["Day", "Week", "Month", "Year"], index=2, horizontal=True, key="fn_gran")
+        with c2:
+            x_dim = st.selectbox("X-axis", ["Time","Country","Academic Counsellor","JetLearn Deal Source"], index=0, key="fn_xdim")
+
+        # Create-date window (requested)
+        today_d = date.today()
+        d1, d2 = st.columns(2)
+        with d1:
+            create_start = st.date_input("Create Date — Start", value=today_d.replace(day=1), key="fn_cstart")
+        with d2:
+            create_end   = st.date_input("Create Date — End",   value=month_bounds(today_d)[1], key="fn_cend")
+        if create_end < create_start:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+        # Booking type options
+        col_b1, col_b2, col_b3 = st.columns([1.0, 1.0, 1.2])
+        with col_b1:
+            booking_filter = st.selectbox("Booking filter", ["All", "Pre-Book only", "Sales-Book only"], index=0, key="fn_bkf",
+                                          help="Pre-Book = 'Calibration Slot (Deal)' has a value; Sales-Book = it is blank.")
+        with col_b2:
+            stack_booking = st.checkbox("Stack by Booking Type in chart", value=False, key="fn_stack_bk")
+        with col_b3:
+            view_mode = st.radio("View as", ["Graph", "Table"], index=0, horizontal=True, key="fn_view")
+
+        # Chart options
+        col_ch1, col_ch2 = st.columns([1.0, 1.2])
+        with col_ch1:
+            chart_type = st.selectbox("Chart", ["Bar","Line","Area","Stacked Bar","Combo (Leads bar + Enrolments line)"], index=0, key="fn_chart")
+        with col_ch2:
+            metrics_pick = st.multiselect(
+                "Metrics to show",
+                ["Deals Created","Enrolments","First Cal Scheduled","Cal Rescheduled","Cal Done",
+                 "Enrolments / Leads %","Enrolments / Cal Done %","Cal Done / First Cal %","First Cal / Leads %"],
+                default=["Deals Created","Enrolments","First Cal Scheduled","Cal Done"],
+                key="fn_metrics"
+            )
+
+        # ---------- Normalize / derived fields ----------
+        C = coerce_datetime(df_f[_create])
+        P = coerce_datetime(df_f[_pay])
+        F = coerce_datetime(df_f[_first]) if (_first and _first in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        R = coerce_datetime(df_f[_resch]) if (_resch and _resch in df_f.columns) else pd.Series(pd.NaT, index=df_f.index)
+        D = coerce_datetime(df_f[_done])  if (_done  and _done  in df_f.columns)  else pd.Series(pd.NaT, index=df_f.index)
+
+        C_date = C.dt.date
+        P_date = P.dt.date
+        F_date = F.dt.date if F is not None else pd.Series(pd.NaT, index=df_f.index)
+        R_date = R.dt.date if R is not None else pd.Series(pd.NaT, index=df_f.index)
+        D_date = D.dt.date if D is not None else pd.Series(pd.NaT, index=df_f.index)
+
+        # Booking type
+        if _slot and _slot in df_f.columns:
+            pre_book = df_f[_slot].astype(str).str.strip().replace({"nan":""}).ne("")
+        else:
+            pre_book = pd.Series(False, index=df_f.index)
+        booking_type = np.where(pre_book, "Pre-Book", "Sales-Book")
+
+        # Dimension columns
+        def norm_cat(s): 
+            return s.fillna("Unknown").astype(str).str.strip()
+        X_country = norm_cat(df_f[_cty]) if _cty else pd.Series("Unknown", index=df_f.index)
+        X_cns     = norm_cat(df_f[_cns]) if _cns else pd.Series("Unknown", index=df_f.index)
+        X_src     = norm_cat(df_f[_src]) if _src else pd.Series("Unknown", index=df_f.index)
+
+        # Population by Create Date range (denominator universe & period slicing)
+        in_create_window = C_date.notna() & (C_date >= create_start) & (C_date <= create_end)
+
+        # ---------- Period key based on granularity ----------
+        def period_key(dt_series):
+            dts = pd.to_datetime(dt_series, errors="coerce")
+            if gran == "Day":
+                return dts.dt.date.astype("datetime64[ns]")  # day as timestamp
+            if gran == "Week":
+                # ISO week start (Mon)
+                return (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date.astype("datetime64[ns]")
+            if gran == "Month":
+                return dts.dt.to_period("M").dt.to_timestamp()
+            if gran == "Year":
+                return dts.dt.to_period("Y").dt.to_timestamp()
+            return dts.dt.to_period("M").dt.to_timestamp()
+
+        # ---------- Build rows per metric ----------
+        # Base mask for booking filter
+        if booking_filter == "Pre-Book only":
+            mask_booking = pre_book
+        elif booking_filter == "Sales-Book only":
+            mask_booking = ~pre_book
+        else:
+            mask_booking = pd.Series(True, index=df_f.index)
+
+        # Per-metric inclusion (MTD vs Cohort) within the *create range*
+        # We'll aggregate by the event's own period key (and for MTD also require: same period as creation)
+        per_create = period_key(C)
+        per_pay    = period_key(P)
+        per_first  = period_key(F)
+        per_resch  = period_key(R)
+        per_done   = period_key(D)
+
+        # Helper: same-period (for MTD) check
+        same_period_pay   = (per_create == per_pay)
+        same_period_first = (per_create == per_first)
+        same_period_resch = (per_create == per_resch)
+        same_period_done  = (per_create == per_done)
+
+        # Masks for each event series
+        m_created = in_create_window & C.notna()
+        if mode == "MTD":
+            m_enrol = in_create_window & P.notna() & same_period_pay
+            m_first = in_create_window & F.notna() & same_period_first
+            m_resch = in_create_window & R.notna() & same_period_resch
+            m_done  = in_create_window & D.notna() & same_period_done
+        else:
+            m_enrol = P.notna() & in_create_window  # Cohort: created in window, counted by payment period (create month may differ but still within window population)
+            m_first = F.notna() & in_create_window
+            m_resch = R.notna() & in_create_window
+            m_done  = D.notna() & in_create_window
+
+        # Apply booking filter
+        m_created &= mask_booking
+        m_enrol   &= mask_booking
+        m_first   &= mask_booking
+        m_resch   &= mask_booking
+        m_done    &= mask_booking
+
+        # ---------- Select X group ----------
+        if x_dim == "Time":
+            X_label = "Period"
+            X_series_created = per_create
+            X_series_enrol   = per_pay
+            X_series_first   = per_first
+            X_series_resch   = per_resch
+            X_series_done    = per_done
+            group_fields = ["Period"]
+        elif x_dim == "Country":
+            X_label = "Country"
+            X_base = X_country
+            X_series_created = X_base
+            X_series_enrol   = X_base
+            X_series_first   = X_base
+            X_series_resch   = X_base
+            X_series_done    = X_base
+            group_fields = ["Country"]
+        elif x_dim == "Academic Counsellor":
+            X_label = "Academic Counsellor"
+            X_base = X_cns
+            X_series_created = X_base
+            X_series_enrol   = X_base
+            X_series_first   = X_base
+            X_series_resch   = X_base
+            X_series_done    = X_base
+            group_fields = ["Academic Counsellor"]
+        else:
+            X_label = "JetLearn Deal Source"
+            X_base = X_src
+            X_series_created = X_base
+            X_series_enrol   = X_base
+            X_series_first   = X_base
+            X_series_resch   = X_base
+            X_series_done    = X_base
+            group_fields = ["JetLearn Deal Source"]
+
+        # Optional color for booking type (if stacked by booking)
+        color_field = "Booking Type" if stack_booking else None
+
+        def _frame(mask, x_series, metric_name):
+            if not mask.any():
+                cols = group_fields + ([color_field] if color_field else []) + [metric_name]
+                return pd.DataFrame(columns=cols)
+            df_tmp = pd.DataFrame({
+                group_fields[0]: x_series[mask],
+                "Booking Type": pd.Series(booking_type, index=df_f.index)[mask]
+            })
+            use_fields = group_fields + ([color_field] if color_field else [])
+            out = (df_tmp.assign(_one=1)
+                         .groupby(use_fields, dropna=False)["_one"]
+                         .sum().rename(metric_name).reset_index())
+            return out
+
+        g_created = _frame(m_created, X_series_created, "Deals Created")
+        g_enrol   = _frame(m_enrol,   X_series_enrol,   "Enrolments")
+        g_first   = _frame(m_first,   X_series_first,   "First Cal Scheduled")
+        g_resch   = _frame(m_resch,   X_series_resch,   "Cal Rescheduled")
+        g_done    = _frame(m_done,    X_series_done,    "Cal Done")
+
+        # Merge all
+        def _merge(a, b):
+            return a.merge(b, on=(group_fields + ([color_field] if color_field else [])), how="outer")
+        grid = _merge(g_created, g_enrol)
+        grid = _merge(grid, g_first)
+        grid = _merge(grid, g_resch)
+        grid = _merge(grid, g_done)
+
+        for c in ["Deals Created","Enrolments","First Cal Scheduled","Cal Rescheduled","Cal Done"]:
+            if c not in grid.columns: grid[c] = 0
+        grid = grid.fillna(0)
+
+        # Derived ratios
+        grid["Enrolments / Leads %"]      = np.where(grid["Deals Created"]>0, grid["Enrolments"]/grid["Deals Created"]*100.0, np.nan)
+        grid["Enrolments / Cal Done %"]   = np.where(grid["Cal Done"]>0,     grid["Enrolments"]/grid["Cal Done"]*100.0,     np.nan)
+        grid["Cal Done / First Cal %"]    = np.where(grid["First Cal Scheduled"]>0, grid["Cal Done"]/grid["First Cal Scheduled"]*100.0, np.nan)
+        grid["First Cal / Leads %"]       = np.where(grid["Deals Created"]>0, grid["First Cal Scheduled"]/grid["Deals Created"]*100.0, np.nan)
+
+        # Sort keys
+        if x_dim == "Time":
+            # Ensure temporal sort
+            grid["__sort"] = pd.to_datetime(grid["Period"])
+            grid = grid.sort_values("__sort").drop(columns="__sort")
+        else:
+            grid = grid.sort_values(group_fields)
+
+        # ---------- Output ----------
+        if view_mode == "Table":
+            show_cols = group_fields + ([color_field] if color_field else []) + metrics_pick
+            st.dataframe(grid[show_cols], use_container_width=True)
+            st.download_button(
+                "Download CSV — Funnel",
+                grid[show_cols].to_csv(index=False).encode("utf-8"),
+                "funnel_output.csv","text/csv",
+                key="fn_dl"
+            )
+            return
+
+        # ---- Graph mode ----
+        # Special case: Combo chart (Leads bar + Enrolments line) only when x_dim == Time and those two metrics chosen.
+        if chart_type.startswith("Combo"):
+            if x_dim != "Time":
+                st.info("Combo chart is available only for Time on X-axis. Showing standard chart instead.")
+            elif not set(["Deals Created","Enrolments"]).issubset(set(grid.columns)):
+                st.info("Combo chart needs Deals Created and Enrolments. Showing standard chart instead.")
+            else:
+                g = grid.copy()
+                base_enc = [
+                    alt.X("Period:T", title=X_label),
+                    alt.Tooltip("yearmonthdate(Period):T", title="Period")
+                ]
+                if color_field:
+                    # facet by Booking Type to keep combo readable
+                    created_bar = (
+                        alt.Chart(g)
+                        .mark_bar(opacity=0.85)
+                        .encode(*base_enc,
+                                y=alt.Y("Deals Created:Q", title="Deals Created"),
+                                column=alt.Column(f"{color_field}:N", title=color_field),
+                                tooltip=base_enc + [alt.Tooltip("Deals Created:Q", format="d")])
+                    )
+                    enrol_line = (
+                        alt.Chart(g)
+                        .mark_line(point=True)
+                        .encode(*base_enc,
+                                y=alt.Y("Enrolments:Q", title="Enrolments"),
+                                column=alt.Column(f"{color_field}:N"),
+                                tooltip=base_enc + [alt.Tooltip("Enrolments:Q", format="d")])
+                    )
+                    st.altair_chart(created_bar & enrol_line, use_container_width=True)
+                else:
+                    created_bar = (
+                        alt.Chart(g).mark_bar(opacity=0.85)
+                        .encode(alt.X("Period:T", title=X_label),
+                                alt.Y("Deals Created:Q", title="Deals Created"),
+                                tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                         alt.Tooltip("Deals Created:Q", format="d")])
+                    )
+                    enrol_line = (
+                        alt.Chart(g).mark_line(point=True)
+                        .encode(alt.X("Period:T", title=X_label),
+                                alt.Y("Enrolments:Q", title="Enrolments"),
+                                tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
+                                         alt.Tooltip("Enrolments:Q", format="d")])
+                    )
+                    st.altair_chart(created_bar + enrol_line, use_container_width=True)
+                # Also let them download the underlying grid
+                st.download_button(
+                    "Download CSV — Combo data",
+                    grid.to_csv(index=False).encode("utf-8"),
+                    "funnel_combo_data.csv","text/csv",
+                    key="fn_dl_combo"
+                )
+                return
+
+        # General chart
+        g = grid.copy()
+        # Build tidy for chosen metrics
+        melt_cols = metrics_pick
+        tidy = g.melt(
+            id_vars=group_fields + ([color_field] if color_field else []),
+            value_vars=melt_cols,
+            var_name="Metric",
+            value_name="Value"
+        )
+
+        # Decide encoding types
+        if x_dim == "Time":
+            x_enc = alt.X("Period:T", title=X_label)
+            tooltip_x = alt.Tooltip("yearmonthdate(Period):T", title="Period")
+        else:
+            x_enc = alt.X(f"{group_fields[0]}:N", title=X_label, sort=sorted(tidy[group_fields[0]].dropna().unique()))
+            tooltip_x = alt.Tooltip(f"{group_fields[0]}:N", title=X_label)
+
+        # If values are percentages, format accordingly
+        any_pct = any(s.endswith("%") for s in metrics_pick)
+        y_title = "Value (count)" if not any_pct else "Value"
+        y_enc = alt.Y("Value:Q", title=y_title)
+
+        # Color: by Metric normally; if stacking booking type, we facet by Metric to keep readability
+        if chart_type == "Stacked Bar":
+            if color_field:
+                # stack booking type, facet by metric
+                ch = (
+                    alt.Chart(tidy)
+                    .mark_bar(opacity=0.9)
+                    .encode(
+                        x=x_enc,
+                        y=y_enc,
+                        color=alt.Color(f"{color_field}:N", title="Booking Type"),
+                        column=alt.Column("Metric:N", title="Metric"),
+                        tooltip=[tooltip_x,
+                                 alt.Tooltip(f"{(color_field or 'Metric')}:N"),
+                                 alt.Tooltip("Metric:N"),
+                                 alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
+                    )
+                    .properties(height=320)
+                )
+            else:
+                ch = (
+                    alt.Chart(tidy)
+                    .mark_bar(opacity=0.9)
+                    .encode(
+                        x=x_enc,
+                        y=y_enc,
+                        color=alt.Color("Metric:N", title="Metric", legend=alt.Legend(orient="bottom")),
+                        tooltip=[tooltip_x, alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
+                    )
+                    .properties(height=360)
+                )
+        else:
+            mark = {"Bar":"bar","Line":"line","Area":"area"}.get(chart_type, "bar")
+            if color_field:
+                # facet by Metric, color booking type
+                ch = (
+                    alt.Chart(tidy)
+                    .mark_line(point=True) if mark=="line" else
+                    alt.Chart(tidy).mark_area(opacity=0.5) if mark=="area" else
+                    alt.Chart(tidy).mark_bar(opacity=0.9)
+                ).encode(
+                    x=x_enc,
+                    y=y_enc,
+                    color=alt.Color(f"{color_field}:N", title="Booking Type", legend=alt.Legend(orient="bottom")),
+                    column=alt.Column("Metric:N", title="Metric"),
+                    tooltip=[tooltip_x, alt.Tooltip(f"{color_field}:N"), alt.Tooltip("Metric:N"),
+                             alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
+                ).properties(height=320)
+            else:
+                ch = (
+                    alt.Chart(tidy)
+                    .mark_line(point=True) if mark=="line" else
+                    alt.Chart(tidy).mark_area(opacity=0.5) if mark=="area" else
+                    alt.Chart(tidy).mark_bar(opacity=0.9)
+                ).encode(
+                    x=x_enc,
+                    y=y_enc,
+                    color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=[tooltip_x, alt.Tooltip("Metric:N"),
+                             alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
+                ).properties(height=360)
+
+        st.altair_chart(ch, use_container_width=True)
+
+        # Download underlying data
+        st.download_button(
+            "Download CSV — Funnel (chart data)",
+            tidy.to_csv(index=False).encode("utf-8"),
+            "funnel_chart_data.csv","text/csv",
+            key="fn_dl_chartdata"
+        )
+
+    # run it
+    _funnel_tab()
