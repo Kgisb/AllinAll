@@ -6345,7 +6345,9 @@ elif view == "Carry Forward":
     # run the tab
     _carry_forward_tab()
 # =========================
+# =========================
 # Buying Propensity Tab (Sales Subscription uses Installment Terms fallback = 1)
+# + NEW: Installment Type Dynamics (kept everything else identical)
 # =========================
 elif view == "Buying Propensity":
     def _buying_propensity_tab():
@@ -6361,6 +6363,9 @@ elif view == "Buying Propensity":
 
         # For derived metric (Sales Subscription)
         _inst  = find_col(df_f, ["Installment Terms","Installments Terms","Installment Count","No. of Installments","EMI Count","Installments"])
+
+        # NEW: Installment Type variable
+        _itype = find_col(df_f, ["Installment Type","InstallmentType","EMI Type","Installment Plan Type","Plan Type"])
 
         # Optional filters
         _cty = country_col     if (country_col     in df_f.columns) else find_col(df_f, ["Country","Student Country","Deal Country"])
@@ -6461,6 +6466,7 @@ elif view == "Buying Propensity":
         PT = norm_cat(df_f[_ptype])
         TERM = pd.to_numeric(df_f[_term], errors="coerce")  # numeric
         INST_raw = pd.to_numeric(df_f[_inst], errors="coerce") if _inst and _inst in df_f.columns else pd.Series(np.nan, index=df_f.index)
+        ITYPE = norm_cat(df_f[_itype]) if _itype and _itype in df_f.columns else pd.Series("Unknown", index=df_f.index)
 
         def between_date(s, a, b):
             return s.notna() & (s >= a) & (s <= b)
@@ -6479,7 +6485,8 @@ elif view == "Buying Propensity":
             "_create": C, "_pay": P,
             "Payment Type": PT,
             "Payment Term": TERM,
-            "Installment Terms": INST_raw
+            "Installment Terms": INST_raw,
+            "Installment Type": ITYPE,   # NEW
         }).loc[win_mask].copy()
 
         # If Installment Terms is NaN or <= 0, treat as 1
@@ -6553,7 +6560,7 @@ elif view == "Buying Propensity":
         # =============================
         # Tabs
         # =============================
-        tabs = st.tabs(["Payment Term Dynamics", "Payment Type Dynamics", "Term × Type (Correlation)"])
+        tabs = st.tabs(["Payment Term Dynamics", "Payment Type Dynamics", "Installment Type Dynamics", "Term × Type (Correlation)"])
 
         # ---- 1) Payment Term Dynamics (includes Sales Subscription) ----
         with tabs[0]:
@@ -6751,31 +6758,110 @@ elif view == "Buying Propensity":
                         key="bp_dl_type_mom"
                     )
 
-        # ---- 3) Term × Type (Correlation-ish view) ----
+        # ---- 3) Installment Type Dynamics (NEW; mirrors Payment Type Dynamics) ----
         with tabs[2]:
+            if not (_itype and _itype in df_f.columns):
+                st.info("‘Installment Type’ column not found — this section is unavailable.", icon="ℹ️")
+            else:
+                itype_view = st.radio("View as", ["Graph", "Table"], horizontal=True, key="bp_itype_view")
+                itype_pct  = st.checkbox("Show % share per month", value=False, key="bp_itype_pct")
+
+                itype_rows = []
+                for pm in months:
+                    msk = month_mask(pm)
+                    if msk.any():
+                        tmp = norm_cat(df_f.loc[msk, _itype]).value_counts(dropna=False).rename_axis("Installment Type").rename("Count").reset_index()
+                        tmp["Month"] = str(pm)
+                        itype_rows.append(tmp)
+                if itype_rows:
+                    itype_mom = pd.concat(itype_rows, ignore_index=True)
+                else:
+                    itype_mom = pd.DataFrame(columns=["Installment Type","Count","Month"])
+
+                if itype_view == "Graph":
+                    if itype_mom.empty:
+                        st.info("No data for Installment Type MoM dynamics.")
+                    else:
+                        if itype_pct:
+                            pct_df = itype_mom.copy()
+                            month_tot = pct_df.groupby("Month")["Count"].transform("sum")
+                            pct_df["Pct"] = np.where(month_tot > 0, pct_df["Count"] / month_tot * 100.0, 0.0)
+                            ch_itype = (
+                                alt.Chart(pct_df)
+                                .mark_bar()
+                                .encode(
+                                    x=alt.X("Month:N", sort=months_list),
+                                    y=alt.Y("Pct:Q", title="% of month", scale=alt.Scale(domain=[0,100])),
+                                    color=alt.Color("Installment Type:N", legend=alt.Legend(orient="bottom")),
+                                    tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Installment Type:N"), alt.Tooltip("Pct:Q", format=".1f")]
+                                )
+                                .properties(height=340, title="MoM — Installment Type % Share")
+                            )
+                        else:
+                            ch_itype = (
+                                alt.Chart(itype_mom)
+                                .mark_bar()
+                                .encode(
+                                    x=alt.X("Month:N", sort=months_list),
+                                    y=alt.Y("Count:Q", title="Count"),
+                                    color=alt.Color("Installment Type:N", legend=alt.Legend(orient="bottom")),
+                                    tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Installment Type:N"), alt.Tooltip("Count:Q")]
+                                )
+                                .properties(height=340, title="MoM — Installment Type Counts")
+                            )
+                        st.altair_chart(ch_itype, use_container_width=True)
+                else:
+                    if itype_mom.empty:
+                        st.info("No data for Installment Type MoM dynamics.")
+                    else:
+                        wide_i = (itype_mom
+                                  .pivot(index="Month", columns="Installment Type", values="Count")
+                                  .reindex(index=months_list)
+                                  .fillna(0.0)
+                                  .reset_index())
+                        st.dataframe(wide_i, use_container_width=True)
+                        st.download_button(
+                            "Download CSV — MoM Installment Type",
+                            wide_i.to_csv(index=False).encode("utf-8"),
+                            "buying_propensity_installment_type_mom.csv", "text/csv",
+                            key="bp_dl_itype_mom"
+                        )
+
+        # ---- 4) Term × Type (Correlation-ish view) ----
+        with tabs[3]:
             metric_pick = st.radio(
                 "Metric",
                 ["Payment Term (mean ± std)", "Sales Subscription (mean ± std)"],
                 index=0, horizontal=True, key="bp_corr_metric",
-                help="Switch to ‘Sales Subscription’ (fallback: Installment Terms=1 if blank/0) to analyze Term ÷ Installment Terms by Payment Type."
+                help="Switch to ‘Sales Subscription’ (fallback: Installment Terms=1 if blank/0) to analyze Term ÷ Installment Terms by group."
+            )
+            # NEW: choose grouping dimension (Payment Type OR Installment Type)
+            group_dim = st.radio(
+                "Group by",
+                ["Payment Type", "Installment Type"],
+                index=0,
+                horizontal=True,
+                key="bp_corr_groupdim"
             )
             corr_view = st.radio("View as", ["Graph", "Table"], horizontal=True, key="bp_corr_view")
 
-            corr_df = df_win[["Payment Type","Payment Term","Sales Subscription"]].copy()
+            # Build corr_df with selected group dimension
+            gcol = "Payment Type" if group_dim == "Payment Type" else "Installment Type"
+            corr_df = df_win[[gcol,"Payment Term","Sales Subscription"]].copy()
             if metric_pick.startswith("Payment Term"):
-                corr_df = corr_df.dropna(subset=["Payment Type","Payment Term"])
+                corr_df = corr_df.dropna(subset=[gcol,"Payment Term"])
                 value_col = "Payment Term"
-                ttl = "Window — Payment Term by Payment Type (mean ± std)"
+                ttl = f"Window — {value_col} by {gcol} (mean ± std)"
             else:
-                corr_df = corr_df.dropna(subset=["Payment Type","Sales Subscription"])
+                corr_df = corr_df.dropna(subset=[gcol,"Sales Subscription"])
                 value_col = "Sales Subscription"
-                ttl = "Window — Sales Subscription by Payment Type (mean ± std)"
+                ttl = f"Window — {value_col} by {gcol} (mean ± std)"
 
             if corr_df.empty:
-                st.info("No rows in the current window for the selected metric.")
+                st.info("No rows in the current window for the selected metric/group.")
             else:
                 summary = (
-                    corr_df.groupby("Payment Type", as_index=False)
+                    corr_df.groupby(gcol, as_index=False)
                            .agg(Count=(value_col,"size"),
                                 Mean=(value_col,"mean"),
                                 Median=(value_col,"median"),
@@ -6791,13 +6877,13 @@ elif view == "Buying Propensity":
                     mean_err["High"] =  mean_err["Mean"] + mean_err["Std"]
 
                     base = alt.Chart(mean_err).encode(
-                        x=alt.X("Payment Type:N", sort=summary.sort_values("Mean")["Payment Type"].tolist())
+                        x=alt.X(f"{gcol}:N", sort=summary.sort_values("Mean")[gcol].tolist())
                     )
                     error = base.mark_errorbar().encode(y=alt.Y("Low:Q", title=value_col), y2="High:Q")
                     bars  = base.mark_bar().encode(
                         y="Mean:Q",
                         tooltip=[
-                            alt.Tooltip("Payment Type:N"),
+                            alt.Tooltip(f"{gcol}:N"),
                             alt.Tooltip("Count:Q"),
                             alt.Tooltip("Mean:Q", format=".2f"),
                             alt.Tooltip("Median:Q", format=".2f"),
@@ -6812,24 +6898,25 @@ elif view == "Buying Propensity":
                             alt.Chart(corr_df)
                             .mark_circle(opacity=0.35, size=40)
                             .encode(
-                                x=alt.X("Payment Type:N"),
+                                x=alt.X(f"{gcol}:N"),
                                 y=alt.Y(f"{value_col}:Q"),
-                                tooltip=[alt.Tooltip("Payment Type:N"), alt.Tooltip(f"{value_col}:Q")]
+                                tooltip=[alt.Tooltip(f"{gcol}:N"), alt.Tooltip(f"{value_col}:Q")]
                             )
-                            .properties(height=320, title=f"Points — {value_col} by Payment Type")
+                            .properties(height=320, title=f"Points — {value_col} by {gcol}")
                         )
                         st.altair_chart(pts, use_container_width=True)
                 else:
                     st.dataframe(summary.sort_values(["Mean","Count"], ascending=[False, False]), use_container_width=True)
                     st.download_button(
-                        "Download CSV — Term/Subscription × Type Summary",
+                        "Download CSV — Summary",
                         summary.to_csv(index=False).encode("utf-8"),
-                        "buying_propensity_term_or_subscription_by_type.csv", "text/csv",
+                        "buying_propensity_correlation_summary.csv", "text/csv",
                         key="bp_dl_corr_summary"
                     )
 
     # run the tab
     _buying_propensity_tab()
+
 # =========================
 # Cash-in Tab (live Google Sheet range A2:D13, fixed header & footer)
 # =========================
