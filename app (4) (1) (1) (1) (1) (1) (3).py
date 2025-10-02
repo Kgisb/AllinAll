@@ -8503,6 +8503,8 @@ elif view == "Master Graph":
 
     # run it
     _master_graph_tab()
+
+
 elif view == "Daily Business":
     import pandas as pd, numpy as np, altair as alt
     from datetime import date, timedelta
@@ -8554,7 +8556,6 @@ elif view == "Daily Business":
     with c2:
         gran = st.radio("Time granularity (x-axis)", ["Day", "Week", "Month", "Year"], index=0, horizontal=True)
 
-    # Range (Create-date window choice, for consistency with your ask)
     today_d = date.today()
     if scope == "Today":
         range_start, range_end = today_d, today_d
@@ -8575,20 +8576,25 @@ elif view == "Daily Business":
 
     st.caption(f"Window: **{range_start} → {range_end}** • Mode: **{mode}** • Granularity: **{gran}**")
 
-    # Group-by and filters
+    # Group-by & mapping (FIX)
+    label_to_col = {
+        "None": None,
+        "Academic Counsellor": "Counsellor",          # base dataframe column
+        "Country": "Country",
+        "JetLearn Deal Source": "JetLearn Deal Source",
+    }
     gp1, gp2, gp3 = st.columns([1.2, 1.2, 1.2])
     with gp1:
-        group_by = st.selectbox("Group by (color/series)", ["None",
-                                                            "Academic Counsellor",
-                                                            "Country",
-                                                            "JetLearn Deal Source"], index=0)
+        group_by_label = st.selectbox("Group by (color/series)",
+                                      list(label_to_col.keys()), index=0)
+        group_by_col = label_to_col[group_by_label]  # actual column name or None
     with gp2:
         chart_type = st.selectbox("Chart type", ["Bar", "Line", "Area (stack)", "Bar + Line (overlay)"], index=3,
                                   help="Bar + Line overlays the 1st metric as bars and 2nd metric as a line (only when Group by is None).")
     with gp3:
         stack_opt = st.checkbox("Stack series (for Bar/Area)", value=True)
 
-    # Pick metrics (allow multi; overlay works best with 2)
+    # Pick metrics
     METRIC_LABELS = [
         "Deals Created",
         "Enrolments",
@@ -8604,7 +8610,7 @@ elif view == "Daily Business":
     metrics_sel = st.multiselect("Metrics to plot", options=METRIC_LABELS,
                                  default=default_metrics, help="Pick 1–4. For Bar+Line, pick up to 2 for best clarity.")
 
-    # Dimension filters with "All"
+    # Filters with "All"
     def _norm_cat(s):
         return s.fillna("Unknown").astype(str).str.strip()
 
@@ -8657,7 +8663,7 @@ elif view == "Daily Business":
     m_resc_win  = _between(R, range_start, range_end) if R is not None else pd.Series(False, index=df_f.index)
     m_done_win  = _between(D, range_start, range_end) if D is not None else pd.Series(False, index=df_f.index)
 
-    # Mode logic for counting events
+    # Mode logic for events
     if mode == "MTD":
         m_enrol_eff = m_pay_win   & m_created_win
         m_first_eff = m_first_win & m_created_win
@@ -8687,7 +8693,6 @@ elif view == "Daily Business":
         if gran == "Day":
             return s.dt.date
         elif gran == "Week":
-            # Use ISO week start (Mon). Represent as period label YYYY-Www
             return s.dt.to_period("W").astype(str)
         elif gran == "Month":
             return s.dt.to_period("M").astype(str)
@@ -8703,17 +8708,19 @@ elif view == "Daily Business":
         df = base.loc[mask.loc[base.index]].copy()
         if df.empty: return pd.DataFrame(columns=["Bucket","Group","Metric","Count"])
         df["Bucket"] = _bucket(date_series.loc[df.index])
-        grp_col = group_by if group_by != "None" else None
-        if grp_col:
-            g = df.groupby(["Bucket", grp_col], dropna=False).size().rename("Count").reset_index()
-            g["Group"] = g[grp_col].astype(str)
-            g["Metric"] = name
-            return g[["Bucket","Group","Metric","Count"]]
+
+        if group_by_col:
+            # ensure the group col exists
+            if group_by_col not in df.columns:
+                return pd.DataFrame(columns=["Bucket","Group","Metric","Count"])
+            g = df.groupby(["Bucket", group_by_col], dropna=False).size().rename("Count").reset_index()
+            g["Group"] = g[group_by_col].astype(str)
         else:
             g = df.groupby(["Bucket"], dropna=False).size().rename("Count").reset_index()
             g["Group"] = "All"
-            g["Metric"] = name
-            return g[["Bucket","Group","Metric","Count"]]
+
+        g["Metric"] = name
+        return g[["Bucket","Group","Metric","Count"]]
 
     created_df = _frame(base["_C"], m_created_win.loc[base.index], "Deals Created")
     enrol_df   = _frame(base["_P"], m_enrol_eff.loc[base.index],  "Enrolments")
@@ -8734,7 +8741,7 @@ elif view == "Daily Business":
         if out is None:
             return pd.DataFrame(columns=["Bucket","Group"])
         out = out.fillna(0)
-        # Ensure all base columns exist
+        # Ensure base columns exist
         for col in ["Deals Created","Enrolments","Calibration Done — Count","First Cal Scheduled — Count","Calibration Rescheduled — Count"]:
             if col not in out.columns: out[col] = 0
         # Derived %
@@ -8751,7 +8758,6 @@ elif view == "Daily Business":
 
     # Order buckets chronologically
     def _bucket_sort_key(b):
-        # try parse Period-like strings; fallback to date
         try:
             if gran == "Day":
                 return pd.to_datetime(b)
@@ -8768,18 +8774,12 @@ elif view == "Daily Business":
             wide[k] = np.nan
     plot_df = wide[keep_cols].melt(id_vars=["Bucket","Group"], var_name="Metric", value_name="Value")
 
-    # ---------------------------------
-    # Chart: flexible rendering options
-    # ---------------------------------
     base_enc = alt.Chart(plot_df)
 
-    # Formatting
     def _is_ratio(m): return m.endswith("%")
 
-    # If Bar + Line overlay selected, only when no grouping and <= 2 metrics
-    overlay_possible = (chart_type == "Bar + Line (overlay)") and (group_by == "None") and (len(metrics_sel) >= 1)
+    overlay_possible = (chart_type == "Bar + Line (overlay)") and (group_by_col is None) and (len(metrics_sel) >= 1)
     if overlay_possible:
-        # bars for first metric; optional line for second metric
         m1 = metrics_sel[0]
         bars = (
             base_enc.transform_filter(alt.datum.Metric == m1)
@@ -8811,10 +8811,12 @@ elif view == "Daily Business":
         st.altair_chart(ch.properties(height=360, title=ttl), use_container_width=True)
 
     else:
-        # Multi-series by group and/or by metric
-        color_field = "Metric:N" if group_by == "None" else f"{group_by}:N"
-        tooltip_common = [alt.Tooltip("Bucket:N"), alt.Tooltip("Group:N", title=(group_by if group_by!="None" else "All")), alt.Tooltip("Metric:N")]
-        # Choose mark
+        color_field = "Metric:N" if group_by_col is None else "Group:N"
+        tooltip_common = [
+            alt.Tooltip("Bucket:N"),
+            alt.Tooltip("Group:N", title=("Group" if group_by_col is None else group_by_label)),
+            alt.Tooltip("Metric:N"),
+        ]
         if chart_type == "Line":
             mark = base_enc.mark_line(point=True)
         elif chart_type == "Area (stack)":
@@ -8824,8 +8826,11 @@ elif view == "Daily Business":
 
         ch = mark.encode(
             x=alt.X("Bucket:N", title="Period"),
-            y=alt.Y("Value:Q", title="Value",
-                    stack=("normalize" if (chart_type!="Line" and stack_opt and group_by!="None" and all(not _is_ratio(m) for m in metrics_sel)) else None)),
+            y=alt.Y(
+                "Value:Q",
+                title="Value",
+                stack=("normalize" if (chart_type!="Line" and stack_opt and group_by_col is not None and all(not _is_ratio(m) for m in metrics_sel)) else None)
+            ),
             color=alt.Color(color_field, legend=alt.Legend(orient="bottom")),
             tooltip=tooltip_common + [alt.Tooltip("Value:Q", format=".1f")]
         ).properties(height=360, title=f"{' / '.join(metrics_sel)}")
@@ -8837,7 +8842,6 @@ elif view == "Daily Business":
     # Table + download
     # ---------------------------
     show = wide.copy()
-    # Round ratios for display
     for k in ["Enrolments / Created %","Enrolments / Cal Done %","Cal Done / First Cal %","First Cal / Created %"]:
         if k in show.columns: show[k] = show[k].round(1)
     st.dataframe(show, use_container_width=True)
