@@ -2117,26 +2117,49 @@ elif view == "80-20":
             st.info("No conversion table for the current selection.")
 
 # =========================
-# Stuck deals – Funnel & Propagation (Created → Trial → Cal Done → Payment)
-# =========================
 elif view == "Stuck deals":
+    import pandas as pd, numpy as np, altair as alt
+    from datetime import date, timedelta
+    from calendar import monthrange
+
     st.subheader("Stuck deals – Funnel & Propagation (Created → Trial → Cal Done → Payment)")
 
-    # ---- helpers (fallbacks if not present in your app)
-    try:
-        months_back_list  # noqa: F401
-    except NameError:
-        def months_back_list(anchor_day: date, n: int):
-            end_per = pd.Period(anchor_day, freq="M")
-            return list(pd.period_range(end=end_per, periods=n, freq="M"))
+    # ---------------------------
+    # Helper: months_back_list()
+    # ---------------------------
+    def months_back_list(end_d: date, k: int):
+        """
+        Return a chronological list of k monthly Periods ending at end_d's month.
 
-    # KPI CSS (same style class you use elsewhere)
+        Parameters
+        ----------
+        end_d : datetime.date
+            Anchor date; the last period in the list is end_d's calendar month.
+        k : int
+            Number of months to include (>=1).
+
+        Returns
+        -------
+        List[pandas.Period]
+            Monthly periods in ascending order, length k, ending at end_d's month.
+
+        Example
+        -------
+        >>> months_back_list(date(2025, 3, 15), 3)
+        [Period('2025-01', 'M'), Period('2025-02', 'M'), Period('2025-03', 'M')]
+        """
+        if k <= 0:
+            return []
+        end_per = pd.Period(end_d, freq="M")
+        return list(pd.period_range(end=end_per, periods=k, freq="M"))
+
+    # Small style for KPI cards
     st.markdown(
         """
         <style>
-          .kpi-card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 10px 12px; background: #ffffff; }
-          .kpi-title { font-size: 0.9rem; color: #6b7280; margin-bottom: 6px; }
-          .kpi-value { font-size: 1.4rem; font-weight: 700; }
+          .kpi-card { border:1px solid #e5e7eb; border-radius:14px; padding:10px 12px; background:#fff; }
+          .kpi-title { font-size:0.9rem; color:#6b7280; margin-bottom:6px; }
+          .kpi-value { font-size:1.4rem; font-weight:700; }
         </style>
         """,
         unsafe_allow_html=True
@@ -2178,7 +2201,7 @@ elif view == "Stuck deals":
     if scope_mode == "Month":
         # Build month list from whatever date columns exist
         candidates = []
-        if create_col and create_col in df_f.columns:
+        if create_col:
             candidates.append(coerce_datetime(df_f[create_col]))
         if first_cal_sched_col and first_cal_sched_col in df_f.columns:
             candidates.append(coerce_datetime(df_f[first_cal_sched_col]))
@@ -2186,7 +2209,7 @@ elif view == "Stuck deals":
             candidates.append(coerce_datetime(df_f[cal_resched_col]))
         if cal_done_col and cal_done_col in df_f.columns:
             candidates.append(coerce_datetime(df_f[cal_done_col]))
-        if pay_col and pay_col in df_f.columns:
+        if pay_col:
             candidates.append(coerce_datetime(df_f[pay_col]))
 
         if candidates:
@@ -2212,30 +2235,33 @@ elif view == "Stuck deals":
 
         sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
         yy, mm = map(int, sel_month.split("-"))
-        range_start, range_end = month_bounds(date(yy, mm, 1))
-        st.caption(f"Scope: **{range_start} → {range_end}**")
+
+        # Month bounds as timestamps (avoid dtype mismatch)
+        range_start = pd.Timestamp(date(yy, mm, 1))
+        range_end   = pd.Timestamp(date(yy, mm, monthrange(yy, mm)[1]))
+
+        st.caption(f"Scope: **{range_start.date()} → {range_end.date()}**")
     else:
         trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
-        range_end = date.today()
-        range_start = range_end - timedelta(days=trailing - 1)
-        st.caption(f"Scope: **{range_start} → {range_end}** (last {trailing} days)")
+        range_end = pd.Timestamp(date.today())
+        range_start = range_end - pd.Timedelta(days=trailing - 1)
+        st.caption(f"Scope: **{range_start.date()} → {range_end.date()}** (last {trailing} days)")
 
-    # Convert bounds to Timestamps (avoid dtype mismatch)
-    rs_ts = pd.Timestamp(range_start)
-    re_ts = pd.Timestamp(range_end)
-
-    # ==== Prepare normalized datetime columns from FILTERED data
+    # ==== Prepare normalized datetime columns
     d = df_f.copy()
-    d["_c"]  = coerce_datetime(d[create_col]) if (create_col and create_col in d.columns) else pd.Series(pd.NaT, index=d.index)
-    d["_f"]  = coerce_datetime(d[first_cal_sched_col]) if (first_cal_sched_col and first_cal_sched_col in d.columns) else pd.Series(pd.NaT, index=d.index)
-    d["_r"]  = coerce_datetime(d[cal_resched_col])     if (cal_resched_col and cal_resched_col in d.columns)     else pd.Series(pd.NaT, index=d.index)
-    d["_fd"] = coerce_datetime(d[cal_done_col])        if (cal_done_col and cal_done_col in d.columns)          else pd.Series(pd.NaT, index=d.index)
-    d["_p"]  = coerce_datetime(d[pay_col])             if (pay_col and pay_col in d.columns)                    else pd.Series(pd.NaT, index=d.index)
+    d["_c"]  = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
+    d["_f"]  = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_r"]  = coerce_datetime(d[cal_resched_col])     if cal_resched_col and cal_resched_col in d.columns     else pd.Series(pd.NaT, index=d.index)
+    d["_fd"] = coerce_datetime(d[cal_done_col])        if cal_done_col and cal_done_col in d.columns          else pd.Series(pd.NaT, index=d.index)
+    d["_p"]  = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
 
     # Effective trial date = min(First Cal, Rescheduled), NaT-safe
     d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
 
     # ==== Filter: Booking type (Pre-Book vs Self-Book) based on Trial + Slot
+    # Rule:
+    #   Pre-Book  = has a Trial date AND Calibration Slot (Deal) is non-empty
+    #   Self-Book = everything else (no trial OR empty slot)
     if calibration_slot_col and calibration_slot_col in d.columns:
         slot_series = d[calibration_slot_col].astype(str)
         _s = slot_series.str.strip().str.lower()
@@ -2257,29 +2283,30 @@ elif view == "Stuck deals":
     else:
         st.info("Calibration Slot (Deal) column not found — booking type filter not applied.")
 
-    # NOTE: Inactivity seek bars have been removed as requested. No inactivity filtering is applied.
+    # Use Timestamp boundaries for between() to avoid dtype mismatch
+    rs, re = pd.Timestamp(range_start), pd.Timestamp(range_end)
 
-    # ==== Cohort: deals CREATED within scope (use normalized timestamps)
-    mask_created = d["_c"].dt.normalize().between(rs_ts, re_ts)
+    # ==== Cohort: deals CREATED within scope
+    mask_created = d["_c"].between(rs, re)
     cohort = d.loc[mask_created].copy()
     total_created = int(len(cohort))
 
     # Stage 2: Trial in SAME scope & same cohort
-    trial_mask = cohort["_trial"].dt.normalize().between(rs_ts, re_ts)
+    trial_mask = cohort["_trial"].between(rs, re)
     trial_df = cohort.loc[trial_mask].copy()
     total_trial = int(len(trial_df))
 
     # Stage 3: Cal Done in SAME scope from those that had Trial in scope
-    caldone_mask = trial_df["_fd"].dt.normalize().between(rs_ts, re_ts)
+    caldone_mask = trial_df["_fd"].between(rs, re)
     caldone_df = trial_df.loc[caldone_mask].copy()
     total_caldone = int(len(caldone_df))
 
     # Stage 4: Payment in SAME scope from those that had Cal Done in scope
-    pay_mask = caldone_df["_p"].dt.normalize().between(rs_ts, re_ts)
+    pay_mask = caldone_df["_p"].between(rs, re)
     pay_df = caldone_df.loc[pay_mask].copy()
     total_pay = int(len(pay_df))
 
-    # ==== Funnel summary (always include Payment stage now)
+    # ==== Funnel summary
     funnel_rows = [
         {"Stage": "Created (T)",            "Count": total_created, "FromPrev_pct": 100.0},
         {"Stage": "Trial (First/Resched)",  "Count": total_trial,   "FromPrev_pct": (total_trial / total_created * 100.0) if total_created > 0 else 0.0},
@@ -2288,7 +2315,6 @@ elif view == "Stuck deals":
     ]
     funnel_df = pd.DataFrame(funnel_rows)
 
-    # Always show something (even when all zeros)
     bar = alt.Chart(funnel_df).mark_bar(opacity=0.9).encode(
         x=alt.X("Count:Q", title="Count"),
         y=alt.Y("Stage:N", sort=list(funnel_df["Stage"])[::-1], title=""),
@@ -2306,7 +2332,6 @@ elif view == "Stuck deals":
     )
     st.altair_chart(bar + txt, use_container_width=True)
 
-    # Quick debug line so you can see data even if bars look empty
     st.caption(
         f"Created: {total_created} • Trial: {total_trial} • Cal Done: {total_caldone} • Payments: {total_pay}"
     )
@@ -2344,23 +2369,23 @@ elif view == "Stuck deals":
     compare_k = st.slider("Compare last N months (ending at selected month or current)", 2, 12, 6, step=1)
 
     # Decide anchor month
-    anchor_day = range_end if scope_mode == "Month" else date.today()
-    months = months_back_list(anchor_day, compare_k)  # returns list of monthly Periods
+    anchor_day = rs.date() if scope_mode == "Month" else date.today()
+    months = months_back_list(anchor_day, compare_k)  # list of monthly Periods
 
     def month_funnel(m_period: pd.Period):
         ms = pd.Timestamp(date(m_period.year, m_period.month, 1))
         me = pd.Timestamp(date(m_period.year, m_period.month, monthrange(m_period.year, m_period.month)[1]))
 
-        coh = d[d["_c"].dt.normalize().between(ms, me)].copy()
+        coh = d[d["_c"].between(ms, me)].copy()
         ct = int(len(coh))
 
-        coh_tr = coh[coh["_trial"].dt.normalize().between(ms, me)].copy()
+        coh_tr = coh[coh["_trial"].between(ms, me)].copy()
         tr = int(len(coh_tr))
 
-        coh_cd = coh_tr[coh_tr["_fd"].dt.normalize().between(ms, me)].copy()
+        coh_cd = coh_tr[coh_tr["_fd"].between(ms, me)].copy()
         cd = int(len(coh_cd))
 
-        py = int(coh_cd["_p"].dt.normalize().between(ms, me).sum())
+        py = int(coh_cd["_p"].between(ms, me).sum())
 
         # propagation avgs
         avg1 = avg_days(coh_tr["_c"], coh_tr["_trial"]) if not coh_tr.empty else np.nan
